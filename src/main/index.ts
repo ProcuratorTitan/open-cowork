@@ -1136,10 +1136,11 @@ app.on('before-quit', async (event) => {
       tray = null;
       return;
     }
-    // Set the flag immediately before any await to prevent re-entrant cleanup
-    isCleaningUp = true;
     event.preventDefault();
     try {
+      // cleanupSandboxResources() sets isCleaningUp itself (and bails if it is
+      // already set) — setting the flag here first made the cleanup body a no-op
+      // and left quit re-entrant only via the flag it was supposed to guard (#297).
       await cleanupSandboxResources();
     } catch (error) {
       logError('[App] before-quit cleanup failed, forcing quit:', error);

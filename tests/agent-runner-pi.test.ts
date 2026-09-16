@@ -67,7 +67,7 @@ describe('ClaudeAgentRunner Open Cowork SDK integration', () => {
 
   it('uses pi DefaultResourceLoader with additionalSkillPaths and appendSystemPrompt', () => {
     expect(agentRunnerContent).toContain('additionalSkillPaths: skillPaths');
-    expect(agentRunnerContent).toContain('appendSystemPrompt: coworkAppendPrompt');
+    expect(agentRunnerContent).toContain('appendSystemPrompt: [coworkAppendPrompt]');
     expect(agentRunnerContent).not.toContain('systemPromptOverride');
   });
 

@@ -1,4 +1,5 @@
-import { getModel, type Api, type Model } from '@mariozechner/pi-ai';
+import { getModel } from '@earendil-works/pi-ai/compat';
+import type { Api, Model } from '@earendil-works/pi-ai';
 import { isOfficialOpenAIBaseUrl } from '../config/auth-utils';
 
 const COMMON_FALLBACK_PROVIDERS = ['openai', 'anthropic', 'google'] as const;
@@ -146,6 +147,10 @@ export function buildSyntheticPiModel(
   const api = apiOverride || inferPiApi(protocol);
   const autoReasoning = reasoning ?? REASONING_MODEL_PATTERN.test(modelId);
   const knownSpecs = lookupModelSpecs(modelId);
+  // ponytail: name-based vision heuristic — ceiling: a vision model without
+  // 'vision/vl/omni/multimodal' in its id defaults to text-only (safe: text-only
+  // models 400 on images, #251). Add an explicit input override if that matters.
+  const looksVision = /vision|vl|omni|multimodal/i.test(modelId);
   return {
     id: modelId,
     name: modelId,
@@ -153,10 +158,13 @@ export function buildSyntheticPiModel(
     provider,
     baseUrl: baseUrl || '',
     reasoning: autoReasoning,
-    input: ['text', 'image'],
+    input: looksVision ? ['text', 'image'] : ['text'],
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     contextWindow: contextWindow ?? knownSpecs?.contextWindow ?? 128000,
     maxTokens: maxTokens ?? knownSpecs?.maxTokens ?? 16384,
+    // Unknown OpenAI-compatible endpoints often reject the optional `strict`
+    // tool parameter (#232/#233); omit it for synthetic models.
+    compat: { supportsStrictMode: false },
   } as Model<Api>;
 }
 
@@ -328,15 +336,24 @@ export function applyPiModelRuntimeOverrides(
     } as typeof nextModel;
   }
 
-  // DeepSeek V4 models on custom/relay endpoints need thinking blocks in content[] array.
+  // DeepSeek V4 models on custom/relay endpoints need thinking blocks in content[]
+  // array, reasoning_content replayed on later turns, and the deepseek thinking
+  // format. 0.85 auto-detects these only for official deepseek.com endpoints (#162/#231).
   if (nextModel.api === 'openai-completions' && DEEPSEEK_V4_MODEL_PATTERN.test(nextModel.id)) {
     const currentCompat = (nextModel.compat || {}) as Record<string, unknown>;
-    if (!currentCompat.requiresThinkingInContent) {
+    const additions: Record<string, unknown> = {};
+    if (currentCompat.requiresThinkingInContent !== true)
+      additions.requiresThinkingInContent = true;
+    if (currentCompat.requiresReasoningContentOnAssistantMessages !== true) {
+      additions.requiresReasoningContentOnAssistantMessages = true;
+    }
+    if (currentCompat.thinkingFormat !== 'deepseek') additions.thinkingFormat = 'deepseek';
+    if (Object.keys(additions).length > 0) {
       nextModel = {
         ...nextModel,
         compat: {
           ...currentCompat,
-          requiresThinkingInContent: true,
+          ...additions,
         },
       } as typeof nextModel;
     }
