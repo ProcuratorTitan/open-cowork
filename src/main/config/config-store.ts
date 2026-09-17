@@ -34,13 +34,21 @@ import { API_PROVIDER_PRESETS, PI_AI_CURATED_PRESETS } from '../../shared/api-mo
 /**
  * Application configuration schema
  */
-export type ProviderType = 'openrouter' | 'anthropic' | 'custom' | 'openai' | 'gemini' | 'ollama';
+export type ProviderType =
+  | 'openrouter'
+  | 'anthropic'
+  | 'custom'
+  | 'openai'
+  | 'openai-codex'
+  | 'gemini'
+  | 'ollama';
 export type CustomProtocolType = 'anthropic' | 'openai' | 'gemini';
 export type AppTheme = 'dark' | 'light' | 'system';
 export type ProviderProfileKey =
   | 'openrouter'
   | 'anthropic'
   | 'openai'
+  | 'openai-codex'
   | 'gemini'
   | 'ollama'
   | 'custom:anthropic'
@@ -189,6 +197,11 @@ const defaultProfiles: Record<ProviderProfileKey, ProviderProfile> = {
     baseUrl: 'https://api.openai.com/v1',
     model: 'gpt-5.4',
   },
+  'openai-codex': {
+    apiKey: '',
+    baseUrl: 'https://chatgpt.com/backend-api',
+    model: 'gpt-5.4',
+  },
   ollama: {
     apiKey: '',
     baseUrl: 'http://localhost:11434/v1',
@@ -334,6 +347,7 @@ const PROFILE_KEYS: ProviderProfileKey[] = [
   'openrouter',
   'anthropic',
   'openai',
+  'openai-codex',
   'gemini',
   'ollama',
   'custom:anthropic',
@@ -348,6 +362,7 @@ function isProviderType(value: unknown): value is ProviderType {
     value === 'anthropic' ||
     value === 'custom' ||
     value === 'openai' ||
+    value === 'openai-codex' ||
     value === 'gemini' ||
     value === 'ollama'
   );
@@ -464,6 +479,9 @@ function profileKeyToProvider(profileKey: ProviderProfileKey): {
   if (profileKey === 'openai') {
     return { provider: 'openai', customProtocol: 'openai' };
   }
+  if (profileKey === 'openai-codex') {
+    return { provider: 'openai-codex', customProtocol: 'openai' };
+  }
   if (profileKey === 'gemini') {
     return { provider: 'gemini', customProtocol: 'gemini' };
   }
@@ -500,7 +518,7 @@ function normalizeCustomProtocol(
 }
 
 function defaultProtocolForProvider(provider: ProviderType): CustomProtocolType {
-  if (provider === 'openai' || provider === 'ollama') {
+  if (provider === 'openai' || provider === 'openai-codex' || provider === 'ollama') {
     return 'openai';
   }
   if (provider === 'gemini') {
@@ -1402,7 +1420,7 @@ export class ConfigStore {
   }
 
   /**
-   * Check if the app is configured (has API key)
+   * Check if the app has a usable provider configuration.
    */
   isConfigured(): boolean {
     return this.hasAnyUsableCredentials(this.getAll());
@@ -1417,6 +1435,10 @@ export class ConfigStore {
   }): boolean {
     if (projection.provider === 'ollama' && !projection.model?.trim()) {
       return false;
+    }
+    if (projection.provider === 'openai-codex') {
+      // OAuth is owned by Pi's ModelRuntime; the model is enough to persist the profile.
+      return Boolean(projection.model?.trim());
     }
     const apiKey = projection.apiKey?.trim();
     if (apiKey) {
@@ -1541,6 +1563,15 @@ export class ConfigStore {
     delete process.env.GEMINI_BASE_URL;
     delete process.env.CLAUDE_CODE_PATH;
     delete process.env.COWORK_WORKDIR;
+
+    // Codex uses its own OAuth-backed ChatGPT transport; never route it through
+    // the ordinary OpenAI/Anthropic environment variables.
+    if (projectedConfig.provider === 'openai-codex') {
+      if (projectedConfig.defaultWorkdir) {
+        process.env.COWORK_WORKDIR = projectedConfig.defaultWorkdir;
+      }
+      return;
+    }
 
     const useOpenAI =
       projectedConfig.provider === 'openai' ||

@@ -160,6 +160,14 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // Config methods
   config: {
     get: (): Promise<AppConfig> => ipcRenderer.invoke('config.get'),
+    codexStatus: (): Promise<{
+      authenticated: boolean;
+      models: Array<{ id: string; name: string }>;
+    }> => ipcRenderer.invoke('config.codexStatus'),
+    codexLogin: (): Promise<{
+      authenticated: boolean;
+      models: Array<{ id: string; name: string }>;
+    }> => ipcRenderer.invoke('config.codexLogin'),
     getPresets: (): Promise<ProviderPresets> => ipcRenderer.invoke('config.getPresets'),
     save: (config: Partial<AppConfig>): Promise<{ success: boolean; config: AppConfig }> =>
       ipcRenderer.invoke('config.save', config),
@@ -411,7 +419,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
   },
 
   memory: {
-    getOverview: (cwd?: string): Promise<MemoryOverview> => ipcRenderer.invoke('memory.getOverview', cwd),
+    getOverview: (cwd?: string): Promise<MemoryOverview> =>
+      ipcRenderer.invoke('memory.getOverview', cwd),
     search: (payload: {
       query: string;
       cwd?: string;
@@ -424,7 +433,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
       ipcRenderer.invoke('memory.rebuildWorkspace', cwd),
     clearWorkspace: (cwd: string): Promise<{ success: boolean; workspaceKey: string }> =>
       ipcRenderer.invoke('memory.clearWorkspace', cwd),
-    clearCoreMemory: (): Promise<{ success: boolean }> => ipcRenderer.invoke('memory.clearCoreMemory'),
+    clearCoreMemory: (): Promise<{ success: boolean }> =>
+      ipcRenderer.invoke('memory.clearCoreMemory'),
     rebuildAll: (): Promise<{ success: boolean; workspaceCount: number; sessionCount: number }> =>
       ipcRenderer.invoke('memory.rebuildAll'),
     listFiles: (): Promise<MemoryDebugFileInfo[]> => ipcRenderer.invoke('memory.listFiles'),
@@ -462,6 +472,14 @@ declare global {
       };
       config: {
         get: () => Promise<AppConfig>;
+        codexStatus: () => Promise<{
+          authenticated: boolean;
+          models: Array<{ id: string; name: string }>;
+        }>;
+        codexLogin: () => Promise<{
+          authenticated: boolean;
+          models: Array<{ id: string; name: string }>;
+        }>;
         getPresets: () => Promise<ProviderPresets>;
         save: (config: Partial<AppConfig>) => Promise<{ success: boolean; config: AppConfig }>;
         createSet: (payload: CreateSetPayload) => Promise<{ success: boolean; config: AppConfig }>;
@@ -665,7 +683,11 @@ declare global {
         rebuildWorkspace: (cwd: string) => Promise<{ success: boolean; workspaceKey: string }>;
         clearWorkspace: (cwd: string) => Promise<{ success: boolean; workspaceKey: string }>;
         clearCoreMemory: () => Promise<{ success: boolean }>;
-        rebuildAll: () => Promise<{ success: boolean; workspaceCount: number; sessionCount: number }>;
+        rebuildAll: () => Promise<{
+          success: boolean;
+          workspaceCount: number;
+          sessionCount: number;
+        }>;
         listFiles: () => Promise<MemoryDebugFileInfo[]>;
         readFile: (filePath: string) => Promise<MemoryDebugFileContent>;
         inspectSession: (

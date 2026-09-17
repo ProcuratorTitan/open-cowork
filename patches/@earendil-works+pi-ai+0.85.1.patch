@@ -43,3 +43,27 @@ index 48464f2..f30c970 100644
          requiresReasoningContentOnAssistantMessages: model.compat.requiresReasoningContentOnAssistantMessages ??
              detected.requiresReasoningContentOnAssistantMessages,
          thinkingFormat: model.compat.thinkingFormat ?? detected.thinkingFormat,
+diff --git a/node_modules/@earendil-works/pi-ai/dist/auth/oauth/load.js b/node_modules/@earendil-works/pi-ai/dist/auth/oauth/load.js
+index 782ae16..504f828 100644
+--- a/node_modules/@earendil-works/pi-ai/dist/auth/oauth/load.js
++++ b/node_modules/@earendil-works/pi-ai/dist/auth/oauth/load.js
+@@ -16,6 +16,10 @@ const importOAuthModule = (specifier) => {
+     const runtimeSpecifier = import.meta.url.endsWith(".js") ? specifier.replace(/\.ts$/, ".js") : specifier;
+     return import(__rewriteRelativeImportExtension(runtimeSpecifier));
+ };
++// Electron bundles pi-ai into a single CommonJS entrypoint. The bundler-opaque
++// dynamic path otherwise resolves beside that entrypoint, where this module
++// does not exist in the packaged app.
++import { openaiCodexOAuth } from "./openai-codex.js";
+ let bundledLoaders;
+ /** Registers statically bundled OAuth flows for standalone Bun binaries. */
+ export function registerBundledOAuthFlowLoaders(loaders) {
+@@ -29,7 +33,7 @@ export const loadAnthropicOAuth = async () => {
+ export const loadOpenAICodexOAuth = async () => {
+     if (bundledLoaders)
+         return bundledLoaders.openaiCodex();
+-    return (await importOAuthModule("./openai-codex.ts")).openaiCodexOAuth;
++    return openaiCodexOAuth;
+ };
+ export const loadGitHubCopilotOAuth = async () => {
+     if (bundledLoaders)

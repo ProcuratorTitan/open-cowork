@@ -51,6 +51,7 @@ export function resolvePiRouteProtocol(provider?: string, customProtocol?: strin
   if (provider === 'ollama') return 'openai';
   if (provider === 'openai') return 'openai';
   if (provider === 'openrouter') return 'openai';
+  if (provider === 'openai-codex') return 'openai-codex';
   if (provider === 'gemini') return 'gemini';
   return provider || 'anthropic';
 }
@@ -90,6 +91,8 @@ export function inferPiApi(protocol: string): string {
     case 'gemini':
     case 'google':
       return 'google-generative-ai';
+    case 'openai-codex':
+      return 'openai-codex-responses';
     case 'openai':
     default:
       return 'openai-completions';
@@ -211,6 +214,9 @@ export function resolvePiModelString(input: PiModelStringInput): string {
     return model;
   }
   const provider = input.provider || 'anthropic';
+  if (provider === 'openai-codex') {
+    return `openai-codex/${model}`;
+  }
   const protocol = input.customProtocol || provider;
   return `${protocol}/${model}`;
 }

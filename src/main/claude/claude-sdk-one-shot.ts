@@ -50,6 +50,11 @@ function resolveProbeApiKey(
   explicitApiKey: string | undefined,
   config: AppConfig
 ): string {
+  if (input.provider === 'openai-codex') {
+    // Codex authenticates through ModelRuntime's ChatGPT OAuth credentials.
+    return '';
+  }
+
   const candidateApiKey = explicitApiKey ?? config.apiKey?.trim() ?? '';
   if (candidateApiKey) {
     return candidateApiKey;
@@ -226,9 +231,12 @@ export async function runPiAiOneShot(
   const resolvedModel = piModel!;
 
   // Set API key via ModelRuntime (for agent sessions) AND env vars (for pi-ai completeSimple)
-  const apiKey = config.apiKey?.trim();
-  if (apiKey) {
-    const modelRuntime = await getSharedModelRuntime();
+  // Codex must use the OAuth credential managed by ModelRuntime, never a stale
+  // API-key value left in a shared config profile.
+  const apiKey = config.provider === 'openai-codex' ? '' : config.apiKey?.trim();
+  const modelRuntime =
+    apiKey || resolvedModel.provider === 'openai-codex' ? await getSharedModelRuntime() : undefined;
+  if (apiKey && modelRuntime) {
     // Set for the config provider
     await modelRuntime.setRuntimeApiKey(provider, apiKey);
     // Also set for the model's native provider if different
@@ -251,14 +259,24 @@ export async function runPiAiOneShot(
     'api:',
     resolvedModel.api
   );
-  const response = await completeSimple(
-    resolvedModel,
-    {
-      systemPrompt,
-      messages: [userMsg],
-    },
-    { ...options, apiKey: apiKey || undefined }
-  );
+  const response =
+    resolvedModel.provider === 'openai-codex'
+      ? await (modelRuntime || (await getSharedModelRuntime())).completeSimple(
+          resolvedModel,
+          {
+            systemPrompt,
+            messages: [userMsg],
+          },
+          options
+        )
+      : await completeSimple(
+          resolvedModel,
+          {
+            systemPrompt,
+            messages: [userMsg],
+          },
+          { ...options, apiKey: apiKey || undefined }
+        );
 
   // pi-ai resolves (not rejects) on provider errors — the error details
   // live in stopReason/errorMessage on the response object.  Surface them
@@ -315,7 +333,7 @@ export async function probeWithClaudeSdk(
     return { ok: false, errorType: 'unknown', details: 'missing_model' };
   }
 
-  if (!probeConfig.apiKey?.trim()) {
+  if (input.provider !== 'openai-codex' && !probeConfig.apiKey?.trim()) {
     return { ok: false, errorType: 'missing_key', details: 'API key is required.' };
   }
 

@@ -1688,7 +1688,9 @@ ${hints.join('\n')}
           ],
         });
       }
-      const apiKey = runtimeConfig.apiKey?.trim();
+      // Codex must stay on Pi's OAuth credential even if an old profile still
+      // contains an API-key-shaped value.
+      const apiKey = provider === 'openai-codex' ? '' : runtimeConfig.apiKey?.trim();
       if (apiKey) {
         // Map our config provider to pi-ai provider name
         const piProvider =
@@ -1702,7 +1704,9 @@ ${hints.join('\n')}
         }
         log('[ClaudeAgentRunner] Set runtime API key for config provider:', piProvider);
       } else {
-        if (provider === 'ollama') {
+        if (provider === 'openai-codex') {
+          log('[ClaudeAgentRunner] Codex configured without API key; relying on ChatGPT OAuth');
+        } else if (provider === 'ollama') {
           log(
             '[ClaudeAgentRunner] Ollama configured without explicit API key; relying on OpenAI-compatible placeholder/env auth path',
             safeStringify({
