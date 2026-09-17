@@ -701,6 +701,21 @@
     "contextUsage": "Context Usage",
     "contextUsageLabel": "{{used}} / {{total}}"
   },
+  "compaction": {
+    "turnsLeft": "turns left",
+    "compactNow": "Compact",
+    "compacting": "Compacting…",
+    "confirmTitle": "Compact context?",
+    "confirmDescription": "Earlier conversation will be summarized to free up context window space. Recent messages and key decisions are preserved.",
+    "confirm": "Compact Now",
+    "history": "Compaction History",
+    "autoCompact": "Auto-compact",
+    "manualCompact": "Manual compact",
+    "tokens": "tokens",
+    "summary": "Summary",
+    "filesReferenced": "Files referenced",
+    "more": "more"
+  },
   "messageCard": {
     "request": "Request",
     "queued": "Queued",
@@ -870,6 +885,14 @@
     "webhookMode": "Webhook mode",
     "webhookDesc": "Feishu pushes messages to your server. A publicly reachable address is required.",
     "localWebhookUrl": "Local webhook URL",
+    "verificationToken": "Verification Token",
+    "verificationTokenPlaceholder": "Verification Token from Feishu Open Platform",
+    "verificationTokenHint": "Used to verify Feishu URL challenge requests. Copy it from Feishu Open Platform → Events & Callbacks.",
+    "verificationTokenRequired": "Webhook mode requires a Feishu verification token.",
+    "encryptKey": "Encrypt Key",
+    "encryptKeyPlaceholder": "Encrypt Key from Feishu Open Platform",
+    "encryptKeyHint": "Required for X-Lark-Signature verification. Copy it from Feishu Open Platform → Events & Callbacks → Encryption.",
+    "encryptKeyRequired": "Webhook mode requires a Feishu Encrypt Key.",
     "useBuiltInNgrok": "Use built-in ngrok",
     "ngrokHelpPrefix": "Get one for free from",
     "ngrokHelpSuffix": "",
@@ -956,5 +979,11 @@
     "description": "An unexpected error occurred in the application. You can try to recover by clicking the button below.",
     "details": "Error details",
     "retry": "Try again"
+  },
+  "subagent": {
+    "label": "Subagent",
+    "completed": "Completed",
+    "inDuration": "in {{duration}}",
+    "showResult": "Show result"
   }
 }

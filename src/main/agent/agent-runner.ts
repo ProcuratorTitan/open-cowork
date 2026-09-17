@@ -1,5 +1,5 @@
 /**
- * @module main/claude/agent-runner
+ * @module main/agent/agent-runner
  *
  * AI query execution engine (1514 lines).
  *
@@ -54,16 +54,21 @@ import type { SkillsAdapter } from '../skills/skills-adapter';
 import { AgentRuntimeExtensionManager } from '../extensions/agent-runtime-extension-manager';
 import { configStore } from '../config/config-store';
 import { normalizeOpenAICompatibleBaseUrl } from '../config/auth-utils';
-import { resolveMessageEndPayload, toUserFacingErrorText } from './agent-runner-message-end';
 import {
-  applyPiModelRuntimeOverrides,
-  buildSyntheticPiModel,
+  buildTerminalErrorEmissionDetails,
+  buildTerminalErrorMessage,
+  resolveAbortDisposition,
+  resolveAssistantStreamErrorText,
+  resolveMessageEndPayload,
+  shouldPreserveExistingTrace,
+  toUserFacingErrorText,
+} from './agent-runner-message-end';
+import {
+  buildSyntheticPiModelFromRuntimeConfig,
   resolvePiRegistryModel,
   resolvePiRouteProtocol,
-  resolveSyntheticPiModelFallback,
 } from './pi-model-resolution';
 import { buildPiSessionRuntimeSignature } from './pi-session-runtime';
-import { ThinkTagStreamParser } from './think-tag-parser';
 import {
   LoopGuard,
   buildAbortUserMessage,
@@ -78,6 +83,7 @@ import {
 } from './tool-result-utils';
 import { fetchOllamaModelInfo } from '../config/ollama-api';
 import { createWindowsBashOperations } from './windows-bash-operations';
+import { createCompactionExtensionFactory } from './compaction-extension';
 
 // Virtual workspace path shown to the model (hides real sandbox path)
 const VIRTUAL_WORKSPACE_PATH = '/workspace';
@@ -296,7 +302,7 @@ async function enrichProcessPathForBuild(): Promise<void> {
   pathEnriched = true;
 
   if (!app.isPackaged) {
-    log('[ClaudeAgentRunner] Dev mode — skipping PATH enrichment');
+    log('[CoworkAgentRunner] Dev mode — skipping PATH enrichment');
     return;
   }
 
@@ -318,11 +324,11 @@ async function enrichProcessPathForBuild(): Promise<void> {
       ).trim();
       if (output) {
         shellPaths = output.split(':').filter((p: string) => p.trim());
-        log(`[ClaudeAgentRunner] Restored ${shellPaths.length} paths from login shell`);
+        log(`[CoworkAgentRunner] Restored ${shellPaths.length} paths from login shell`);
       }
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);
-      logWarn(`[ClaudeAgentRunner] Could not restore shell PATH: ${message}`);
+      logWarn(`[CoworkAgentRunner] Could not restore shell PATH: ${message}`);
     }
   } else if (platform === 'win32') {
     try {
@@ -339,11 +345,11 @@ async function enrichProcessPathForBuild(): Promise<void> {
       ).trim();
       if (output) {
         shellPaths = output.split(';').filter((p: string) => p.trim());
-        log(`[ClaudeAgentRunner] Restored ${shellPaths.length} paths from Windows registry`);
+        log(`[CoworkAgentRunner] Restored ${shellPaths.length} paths from Windows registry`);
       }
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);
-      logWarn(`[ClaudeAgentRunner] Could not restore Windows PATH: ${message}`);
+      logWarn(`[CoworkAgentRunner] Could not restore Windows PATH: ${message}`);
     }
   }
 
@@ -379,7 +385,7 @@ async function enrichProcessPathForBuild(): Promise<void> {
 
   process.env.PATH = merged.join(delimiter);
   log(
-    `[ClaudeAgentRunner] Enriched process.env.PATH for build mode: ${bundledDirs.length} bundled + ${shellPaths.length} shell + ${currentPaths.length} process → ${merged.length} total`
+    `[CoworkAgentRunner] Enriched process.env.PATH for build mode: ${bundledDirs.length} bundled + ${shellPaths.length} shell + ${currentPaths.length} process → ${merged.length} total`
   );
 }
 
@@ -414,7 +420,7 @@ function buildMcpCustomTools(mcpManager: MCPManager): ToolDefinition[] {
                 : undefined,
           };
         } catch (err: unknown) {
-          logError(`[ClaudeAgentRunner] MCP tool ${mcpTool.name} failed:`, err);
+          logError(`[CoworkAgentRunner] MCP tool ${mcpTool.name} failed:`, err);
           throw err instanceof Error ? err : new Error(String(err));
         }
       },
@@ -536,14 +542,14 @@ interface CachedPiSession {
 }
 
 /**
- * ClaudeAgentRunner - Uses @earendil-works/pi-coding-agent SDK
+ * CoworkAgentRunner - Uses @earendil-works/pi-coding-agent SDK
  *
  * Environment variables should be set before running:
  *   ANTHROPIC_BASE_URL=https://openrouter.ai/api
  *   ANTHROPIC_AUTH_TOKEN=your_openrouter_api_key
  *   ANTHROPIC_API_KEY="" (must be empty)
  */
-export class ClaudeAgentRunner {
+export class CoworkAgentRunner {
   private sendToRenderer: (event: ServerEvent) => void;
   private saveMessage?: (message: Message) => void;
   private requestSudoPassword?: (
@@ -581,10 +587,10 @@ export class ClaudeAgentRunner {
       try {
         cached.session.dispose();
       } catch (e) {
-        logWarn('[ClaudeAgentRunner] dispose error:', e);
+        logWarn('[CoworkAgentRunner] dispose error:', e);
       }
       this.piSessions.delete(sessionId);
-      log('[ClaudeAgentRunner] Disposed pi session for:', sessionId);
+      log('[CoworkAgentRunner] Disposed pi session for:', sessionId);
     }
   }
 
@@ -603,7 +609,7 @@ export class ClaudeAgentRunner {
   invalidateMcpServersCache(): void {
     this._mcpServersCache = null;
     // Sessions stay alive — MCP tools are rebuilt each query via buildMcpCustomTools()
-    log('[ClaudeAgentRunner] MCP servers cache invalidated — tools will rebuild on next query');
+    log('[CoworkAgentRunner] MCP servers cache invalidated — tools will rebuild on next query');
   }
 
   // TODO: Credentials should be served via a secure MCP tool or IPC channel,
@@ -679,7 +685,7 @@ ${hints.join('\n')}
           appliedPlugins.push({ name: plugin.name, path: runtimeSkillsPath });
         }
       } catch (error) {
-        logWarn('[ClaudeAgentRunner] Failed to resolve runtime plugin skill paths:', error);
+        logWarn('[CoworkAgentRunner] Failed to resolve runtime plugin skill paths:', error);
       }
     }
 
@@ -718,12 +724,12 @@ ${hints.join('\n')}
 
     for (const p of possiblePaths) {
       if (fs.existsSync(p)) {
-        log('[ClaudeAgentRunner] Found built-in skills at:', p);
+        log('[CoworkAgentRunner] Found built-in skills at:', p);
         return p;
       }
     }
 
-    logWarn('[ClaudeAgentRunner] No built-in skills directory found');
+    logWarn('[CoworkAgentRunner] No built-in skills directory found');
     return '';
   }
 
@@ -741,12 +747,12 @@ ${hints.join('\n')}
     }
   }
 
-  private getAppClaudeDir(): string {
+  private getAppAgentDir(): string {
     return path.join(app.getPath('userData'), 'claude');
   }
 
   private getRuntimeSkillsDir(): string {
-    return path.join(this.getAppClaudeDir(), 'skills');
+    return path.join(this.getAppAgentDir(), 'skills');
   }
 
   private getConfiguredGlobalSkillsDir(): string {
@@ -764,12 +770,12 @@ ${hints.join('\n')}
         return resolvedPath;
       }
       logWarn(
-        '[ClaudeAgentRunner] Configured skills path is not a directory, fallback to runtime path:',
+        '[CoworkAgentRunner] Configured skills path is not a directory, fallback to runtime path:',
         resolvedPath
       );
     } catch (error) {
       logWarn(
-        '[ClaudeAgentRunner] Configured skills path is unavailable, fallback to runtime path:',
+        '[CoworkAgentRunner] Configured skills path is unavailable, fallback to runtime path:',
         resolvedPath,
         error
       );
@@ -778,12 +784,12 @@ ${hints.join('\n')}
     return this.getRuntimeSkillsDir();
   }
 
-  private getUserClaudeSkillsDir(): string {
+  private getUserSkillsDir(): string {
     return path.join(app.getPath('home'), '.claude', 'skills');
   }
 
   private syncUserSkillsToAppDir(appSkillsDir: string): void {
-    const userSkillsDir = this.getUserClaudeSkillsDir();
+    const userSkillsDir = this.getUserSkillsDir();
     if (!fs.existsSync(userSkillsDir)) {
       return;
     }
@@ -812,7 +818,7 @@ ${hints.join('\n')}
         try {
           this.copyDirectorySync(sourcePath, targetPath);
         } catch (copyErr) {
-          logWarn('[ClaudeAgentRunner] Failed to import user skill:', entry.name, copyErr);
+          logWarn('[CoworkAgentRunner] Failed to import user skill:', entry.name, copyErr);
         }
       }
     }
@@ -847,7 +853,7 @@ ${hints.join('\n')}
         try {
           this.copyDirectorySync(sourcePath, targetPath);
         } catch (copyErr) {
-          logWarn('[ClaudeAgentRunner] Failed to sync configured skill:', entry.name, copyErr);
+          logWarn('[CoworkAgentRunner] Failed to sync configured skill:', entry.name, copyErr);
         }
       }
     }
@@ -890,10 +896,10 @@ ${hints.join('\n')}
     this._skillsAdapter = skillsAdapter;
     this.extensionManager = extensionManager;
 
-    log('[ClaudeAgentRunner] Initialized with Open Cowork agent SDK');
-    log('[ClaudeAgentRunner] Skills enabled: settingSources=[user, project], Skill tool enabled');
+    log('[CoworkAgentRunner] Initialized with Open Cowork agent SDK');
+    log('[CoworkAgentRunner] Skills enabled: settingSources=[user, project], Skill tool enabled');
     if (mcpManager) {
-      log('[ClaudeAgentRunner] MCP support enabled');
+      log('[CoworkAgentRunner] MCP support enabled');
     }
   }
 
@@ -915,7 +921,7 @@ ${hints.join('\n')}
    */
   private installPermissionHook(piSession: PiAgentSession, sessionId: string): void {
     if (!this.requestPermission) {
-      log('[ClaudeAgentRunner] No requestPermission callback — skipping permission hook');
+      log('[CoworkAgentRunner] No requestPermission callback — skipping permission hook');
       return;
     }
 
@@ -929,7 +935,7 @@ ${hints.join('\n')}
     const agent = (piSession as any).agent;
     if (!agent || typeof agent.setBeforeToolCall !== 'function') {
       logWarn(
-        '[ClaudeAgentRunner] Cannot access agent.setBeforeToolCall — skipping permission hook'
+        '[CoworkAgentRunner] Cannot access agent.setBeforeToolCall — skipping permission hook'
       );
       return;
     }
@@ -957,7 +963,7 @@ ${hints.join('\n')}
         const displayName = getDisplayName(toolName);
 
         if (decision === 'deny') {
-          log(`[ClaudeAgentRunner] Tool '${toolName}' denied by rule`);
+          log(`[CoworkAgentRunner] Tool '${toolName}' denied by rule`);
           return {
             block: true,
             reason: `Tool '${displayName}' is denied by your permission rules.`,
@@ -974,7 +980,7 @@ ${hints.join('\n')}
             result = await requestPermission(sessionId, toolUseId, displayName, input);
           } catch (permErr) {
             logError(
-              `[ClaudeAgentRunner] Permission request failed for '${toolName}' — failing closed`,
+              `[CoworkAgentRunner] Permission request failed for '${toolName}' — failing closed`,
               permErr
             );
             return {
@@ -984,7 +990,7 @@ ${hints.join('\n')}
           }
 
           if (result === 'deny') {
-            log(`[ClaudeAgentRunner] Tool '${toolName}' denied by user`);
+            log(`[CoworkAgentRunner] Tool '${toolName}' denied by user`);
             return { block: true, reason: `User denied permission for '${displayName}'.` };
           }
 
@@ -999,7 +1005,7 @@ ${hints.join('\n')}
     );
 
     log(
-      `[ClaudeAgentRunner] Permission hook installed on session ${sessionId} via agent.setBeforeToolCall`
+      `[CoworkAgentRunner] Permission hook installed on session ${sessionId} via agent.setBeforeToolCall`
     );
   }
 
@@ -1064,12 +1070,12 @@ ${hints.join('\n')}
         ) => {
           const command = params.command;
 
-          if (ClaudeAgentRunner.isSudoCommand(command)) {
-            log('[ClaudeAgentRunner] Sudo command detected, requesting password');
+          if (CoworkAgentRunner.isSudoCommand(command)) {
+            log('[CoworkAgentRunner] Sudo command detected, requesting password');
             const password = await requestSudoPassword(sessionId, toolCallId, command);
 
             if (!password) {
-              log('[ClaudeAgentRunner] Sudo password cancelled by user');
+              log('[CoworkAgentRunner] Sudo password cancelled by user');
               return {
                 content: [
                   { type: 'text' as const, text: 'Command cancelled: user denied sudo password.' },
@@ -1084,7 +1090,7 @@ ${hints.join('\n')}
             // Pass password via stdin pipe so it never appears in process args
             // or environment variables. Uses async spawn with stdio: 'pipe'.
             log(
-              '[ClaudeAgentRunner] Executing sudo command with password injection (via stdin pipe)'
+              '[CoworkAgentRunner] Executing sudo command with password injection (via stdin pipe)'
             );
             try {
               const shell = process.platform === 'win32' ? 'cmd.exe' : '/bin/sh';
@@ -1124,7 +1130,7 @@ ${hints.join('\n')}
                 details: undefined as unknown,
               };
             } catch (sudoErr) {
-              logError('[ClaudeAgentRunner] Sudo command failed:', sudoErr);
+              logError('[CoworkAgentRunner] Sudo command failed:', sudoErr);
               throw sudoErr instanceof Error ? sudoErr : new Error(String(sudoErr));
             }
           }
@@ -1172,9 +1178,9 @@ ${hints.join('\n')}
     const routeModel = preferredModel?.trim();
     const configuredModel = configStore.get('model')?.trim();
     const model = routeModel || configuredModel || 'anthropic/claude-sonnet-4-6';
-    logCtx('[ClaudeAgentRunner] Current model:', model);
+    logCtx('[CoworkAgentRunner] Current model:', model);
     logCtx(
-      '[ClaudeAgentRunner] Model source:',
+      '[CoworkAgentRunner] Model source:',
       routeModel ? 'runtimeRoute.model' : configuredModel ? 'configStore.model' : 'default'
     );
     return model;
@@ -1182,7 +1188,7 @@ ${hints.join('\n')}
 
   async run(session: Session, prompt: string, existingMessages: Message[]): Promise<void> {
     const runStartTime = Date.now();
-    logCtx('[ClaudeAgentRunner] run() started');
+    logCtx('[CoworkAgentRunner] run() started');
 
     const controller = new AbortController();
     try {
@@ -1215,6 +1221,10 @@ ${hints.join('\n')}
     // The catch block consults this flag to avoid overwriting the 'error' trace
     // status that handleLoopGuardDecision has already published.
     let abortedByLoopGuard = false;
+    // Set to true when the provider emits a terminal stream error mid-turn.
+    // The catch block consults this flag to avoid overwriting the published
+    // 'Request failed' trace state with a generic 'Cancelled' update.
+    let abortedByStreamError = false;
 
     try {
       this.pathResolver.registerSession(session.id, session.mountedPaths);
@@ -1235,13 +1245,13 @@ ${hints.join('\n')}
 
       // Use session's cwd - each session has its own working directory
       const workingDir = session.cwd || undefined;
-      logCtx('[ClaudeAgentRunner] Working directory:', workingDir || '(none)');
+      logCtx('[CoworkAgentRunner] Working directory:', workingDir || '(none)');
 
       // Initialize sandbox sync if WSL mode is active
       const sandbox = getSandboxAdapter();
 
       if (sandbox.isWSL && sandbox.wslStatus?.distro && workingDir) {
-        log('[ClaudeAgentRunner] WSL mode active, initializing sandbox sync...');
+        log('[CoworkAgentRunner] WSL mode active, initializing sandbox sync...');
 
         // Only show sync UI for new sessions (first message)
         const isNewSession = !SandboxSync.hasSession(session.id);
@@ -1268,9 +1278,9 @@ ${hints.join('\n')}
         if (syncResult.success) {
           sandboxPath = syncResult.sandboxPath;
           useSandboxIsolation = true;
-          log(`[ClaudeAgentRunner] Sandbox initialized: ${sandboxPath}`);
+          log(`[CoworkAgentRunner] Sandbox initialized: ${sandboxPath}`);
           log(
-            `[ClaudeAgentRunner]   Files: ${syncResult.fileCount}, Size: ${syncResult.totalSize} bytes`
+            `[CoworkAgentRunner]   Files: ${syncResult.fileCount}, Size: ${syncResult.totalSize} bytes`
           );
 
           if (isNewSession) {
@@ -1304,7 +1314,7 @@ ${hints.join('\n')}
               // Use rsync via execFileSync with array args to avoid shell injection
               const wslSourcePath = pathConverter.toWSL(builtinSkillsPath);
               log(
-                `[ClaudeAgentRunner] Copying skills with rsync: ${wslSourcePath}/ -> ${sandboxSkillsPath}/`
+                `[CoworkAgentRunner] Copying skills with rsync: ${wslSourcePath}/ -> ${sandboxSkillsPath}/`
               );
 
               execFileSync(
@@ -1327,7 +1337,7 @@ ${hints.join('\n')}
             if (fs.existsSync(appSkillsDir)) {
               const wslSourcePath = pathConverter.toWSL(appSkillsDir);
               log(
-                `[ClaudeAgentRunner] Copying app skills with rsync: ${wslSourcePath}/ -> ${sandboxSkillsPath}/`
+                `[CoworkAgentRunner] Copying app skills with rsync: ${wslSourcePath}/ -> ${sandboxSkillsPath}/`
               );
 
               execFileSync(
@@ -1353,10 +1363,10 @@ ${hints.join('\n')}
               .split(/\r?\n/)
               .filter(Boolean);
 
-            log(`[ClaudeAgentRunner] Skills copied to sandbox: ${sandboxSkillsPath}`);
-            log(`[ClaudeAgentRunner]   Skills: ${copiedSkills.join(', ')}`);
+            log(`[CoworkAgentRunner] Skills copied to sandbox: ${sandboxSkillsPath}`);
+            log(`[CoworkAgentRunner]   Skills: ${copiedSkills.join(', ')}`);
           } catch (error) {
-            logError('[ClaudeAgentRunner] Failed to copy skills to sandbox:', error);
+            logError('[CoworkAgentRunner] Failed to copy skills to sandbox:', error);
           }
 
           if (isNewSession) {
@@ -1374,8 +1384,8 @@ ${hints.join('\n')}
             });
           }
         } else {
-          logError('[ClaudeAgentRunner] Sandbox sync failed:', syncResult.error);
-          log('[ClaudeAgentRunner] Falling back to /mnt/ access (less secure)');
+          logError('[CoworkAgentRunner] Sandbox sync failed:', syncResult.error);
+          log('[CoworkAgentRunner] Falling back to /mnt/ access (less secure)');
 
           if (isNewSession) {
             // Notify UI: error (only for new sessions)
@@ -1394,7 +1404,7 @@ ${hints.join('\n')}
 
       // Initialize sandbox sync if Lima mode is active
       if (sandbox.isLima && sandbox.limaStatus?.instanceRunning && workingDir) {
-        log('[ClaudeAgentRunner] Lima mode active, initializing sandbox sync...');
+        log('[CoworkAgentRunner] Lima mode active, initializing sandbox sync...');
 
         const { LimaSync } = await import('../sandbox/lima-sync');
 
@@ -1419,9 +1429,9 @@ ${hints.join('\n')}
         if (syncResult.success) {
           sandboxPath = syncResult.sandboxPath;
           useSandboxIsolation = true;
-          log(`[ClaudeAgentRunner] Sandbox initialized: ${sandboxPath}`);
+          log(`[CoworkAgentRunner] Sandbox initialized: ${sandboxPath}`);
           log(
-            `[ClaudeAgentRunner]   Files: ${syncResult.fileCount}, Size: ${syncResult.totalSize} bytes`
+            `[CoworkAgentRunner]   Files: ${syncResult.fileCount}, Size: ${syncResult.totalSize} bytes`
           );
 
           if (isNewLimaSession) {
@@ -1458,7 +1468,7 @@ ${hints.join('\n')}
               // Use rsync via execFileSync with array args to avoid shell injection
               // Lima mounts /Users directly, so paths are the same
               log(
-                `[ClaudeAgentRunner] Copying skills with rsync: ${builtinSkillsPath}/ -> ${sandboxSkillsPath}/`
+                `[CoworkAgentRunner] Copying skills with rsync: ${builtinSkillsPath}/ -> ${sandboxSkillsPath}/`
               );
 
               execFileSync(
@@ -1488,7 +1498,7 @@ ${hints.join('\n')}
 
             if (fs.existsSync(appSkillsDir)) {
               log(
-                `[ClaudeAgentRunner] Copying app skills with rsync: ${appSkillsDir}/ -> ${sandboxSkillsPath}/`
+                `[CoworkAgentRunner] Copying app skills with rsync: ${appSkillsDir}/ -> ${sandboxSkillsPath}/`
               );
 
               execFileSync(
@@ -1522,10 +1532,10 @@ ${hints.join('\n')}
               .split(/\r?\n/)
               .filter(Boolean);
 
-            log(`[ClaudeAgentRunner] Skills copied to sandbox: ${sandboxSkillsPath}`);
-            log(`[ClaudeAgentRunner]   Skills: ${copiedSkills.join(', ')}`);
+            log(`[CoworkAgentRunner] Skills copied to sandbox: ${sandboxSkillsPath}`);
+            log(`[CoworkAgentRunner]   Skills: ${copiedSkills.join(', ')}`);
           } catch (error) {
-            logError('[ClaudeAgentRunner] Failed to copy skills to sandbox:', error);
+            logError('[CoworkAgentRunner] Failed to copy skills to sandbox:', error);
           }
 
           if (isNewLimaSession) {
@@ -1543,8 +1553,8 @@ ${hints.join('\n')}
             });
           }
         } else {
-          logError('[ClaudeAgentRunner] Sandbox sync failed:', syncResult.error);
-          log('[ClaudeAgentRunner] Falling back to direct access (less secure)');
+          logError('[CoworkAgentRunner] Sandbox sync failed:', syncResult.error);
+          log('[CoworkAgentRunner] Falling back to direct access (less secure)');
 
           if (isNewLimaSession) {
             // Notify UI: error (only for new sessions)
@@ -1565,12 +1575,12 @@ ${hints.join('\n')}
       const lastUserMessage =
         existingMessages.length > 0 ? existingMessages[existingMessages.length - 1] : null;
 
-      logCtx('[ClaudeAgentRunner] Total messages:', existingMessages.length);
+      logCtx('[CoworkAgentRunner] Total messages:', existingMessages.length);
 
       const hasImages =
         lastUserMessage?.content.some((c) => (c as { type?: string }).type === 'image') || false;
       if (hasImages) {
-        log('[ClaudeAgentRunner] User message contains images');
+        log('[CoworkAgentRunner] User message contains images');
       }
 
       logTiming('before pi-ai model resolution', runStartTime);
@@ -1600,40 +1610,21 @@ ${hints.join('\n')}
 
       if (!piModel) {
         usedSyntheticModel = true;
-        // Synthetic fallback: construct a Model for unknown/custom models
-        const synthetic = resolveSyntheticPiModelFallback({
-          rawModel: runtimeConfig.model,
+        // Synthetic fallback: construct a Model for unknown/custom models.
+        // Reads contextWindow/maxTokens from the flat runtime AppConfig.
+        piModel = buildSyntheticPiModelFromRuntimeConfig(runtimeConfig, {
           resolvedModelString: modelString,
-          rawProvider: runtimeConfig.provider,
           routeProtocol: configProtocol,
-          baseUrl: effectiveBaseUrl,
-        });
-        piModel = buildSyntheticPiModel(
-          synthetic.modelId,
-          synthetic.provider,
-          configProtocol,
           effectiveBaseUrl,
-          undefined,
-          undefined,
-          runtimeConfig.contextWindow,
-          runtimeConfig.maxTokens
-        );
-        // Apply the same runtime overrides (developer role compat, base URL, API downgrade)
-        // that resolvePiRegistryModel applies to registry models
-        piModel = applyPiModelRuntimeOverrides(piModel, {
-          configProvider: configProtocol,
-          customBaseUrl: effectiveBaseUrl,
-          rawProvider: runtimeConfig.provider,
-          customProtocol: runtimeConfig.customProtocol,
         });
         logCtxWarn(
-          '[ClaudeAgentRunner] Model not in pi-ai registry, using synthetic model:',
+          '[CoworkAgentRunner] Model not in pi-ai registry, using synthetic model:',
           modelString,
           '→',
           piModel.api
         );
       }
-      logCtx('[ClaudeAgentRunner] Resolved pi-ai model:', piModel.provider, piModel.id);
+      logCtx('[CoworkAgentRunner] Resolved pi-ai model:', piModel.provider, piModel.id);
 
       // For Ollama: query actual context window from /api/show if user hasn't configured one
       const provider = runtimeConfig.provider || 'anthropic';
@@ -1647,7 +1638,7 @@ ${hints.join('\n')}
         });
         if (ollamaInfo.contextWindow) {
           log(
-            '[ClaudeAgentRunner] Ollama /api/show reported contextWindow:',
+            '[CoworkAgentRunner] Ollama /api/show reported contextWindow:',
             ollamaInfo.contextWindow,
             '(was:',
             piModel.contextWindow,
@@ -1700,15 +1691,15 @@ ${hints.join('\n')}
         // google/gemini via openrouter, pi-ai looks up "google" not "openrouter")
         if (piModel.provider !== piProvider) {
           await modelRuntime.setRuntimeApiKey(piModel.provider, apiKey);
-          log('[ClaudeAgentRunner] Set runtime API key for model provider:', piModel.provider);
+          log('[CoworkAgentRunner] Set runtime API key for model provider:', piModel.provider);
         }
-        log('[ClaudeAgentRunner] Set runtime API key for config provider:', piProvider);
+        log('[CoworkAgentRunner] Set runtime API key for config provider:', piProvider);
       } else {
         if (provider === 'openai-codex') {
           log('[ClaudeAgentRunner] Codex configured without API key; relying on ChatGPT OAuth');
         } else if (provider === 'ollama') {
           log(
-            '[ClaudeAgentRunner] Ollama configured without explicit API key; relying on OpenAI-compatible placeholder/env auth path',
+            '[CoworkAgentRunner] Ollama configured without explicit API key; relying on OpenAI-compatible placeholder/env auth path',
             safeStringify({
               provider,
               modelProvider: piModel.provider,
@@ -1717,12 +1708,12 @@ ${hints.join('\n')}
             })
           );
         } else {
-          logWarn('[ClaudeAgentRunner] No API key configured for provider:', provider);
+          logWarn('[CoworkAgentRunner] No API key configured for provider:', provider);
         }
       }
 
       // baseUrl is now embedded in the model object via resolvePiModel()
-      logCtx('[ClaudeAgentRunner] Model baseUrl:', piModel.baseUrl, 'api:', piModel.api);
+      logCtx('[CoworkAgentRunner] Model baseUrl:', piModel.baseUrl, 'api:', piModel.api);
 
       logTiming('after pi-ai model resolution', runStartTime);
 
@@ -1733,7 +1724,7 @@ ${hints.join('\n')}
 
       // Use app-specific Claude config directory to avoid conflicts with user settings
       // SDK uses CLAUDE_CONFIG_DIR to locate skills
-      const userClaudeDir = this.getAppClaudeDir();
+      const userAgentDir = this.getAppAgentDir();
 
       // Skills directory setup: only run on the first query per runner instance.
       // Symlinks and directories are stable across queries; re-running every time
@@ -1744,8 +1735,8 @@ ${hints.join('\n')}
         this._skillsSetupDone = true;
 
         // Ensure app Claude config directory exists
-        if (!fs.existsSync(userClaudeDir)) {
-          fs.mkdirSync(userClaudeDir, { recursive: true });
+        if (!fs.existsSync(userAgentDir)) {
+          fs.mkdirSync(userAgentDir, { recursive: true });
         }
 
         // Ensure app Claude skills directory exists
@@ -1773,7 +1764,7 @@ ${hints.join('\n')}
                 const linkTarget = fs.readlinkSync(userSkillPath);
                 if (/\.asar[/\\]/.test(linkTarget)) {
                   fs.unlinkSync(userSkillPath);
-                  log(`[ClaudeAgentRunner] Removed broken asar symlink: ${userSkillPath}`);
+                  log(`[CoworkAgentRunner] Removed broken asar symlink: ${userSkillPath}`);
                 }
               }
             } catch {
@@ -1785,15 +1776,15 @@ ${hints.join('\n')}
               if (sourceInsideAsar) {
                 // Source is inside .asar — must copy (symlinks to asar paths fail at OS level)
                 this.copyDirectorySync(builtinSkillPath, userSkillPath);
-                log(`[ClaudeAgentRunner] Copied built-in skill from asar: ${skillName}`);
+                log(`[CoworkAgentRunner] Copied built-in skill from asar: ${skillName}`);
               } else {
                 // Source is a real directory — symlink for space efficiency
                 try {
                   fs.symlinkSync(builtinSkillPath, userSkillPath, 'dir');
-                  log(`[ClaudeAgentRunner] Linked built-in skill: ${skillName}`);
+                  log(`[CoworkAgentRunner] Linked built-in skill: ${skillName}`);
                 } catch (err) {
                   logWarn(
-                    `[ClaudeAgentRunner] Failed to symlink ${skillName}, copying instead:`,
+                    `[CoworkAgentRunner] Failed to symlink ${skillName}, copying instead:`,
                     err
                   );
                   this.copyDirectorySync(builtinSkillPath, userSkillPath);
@@ -1810,17 +1801,17 @@ ${hints.join('\n')}
       // Build available skills section dynamically — now handled by pi's DefaultResourceLoader
       // via additionalSkillPaths. No custom prompt building needed.
 
-      log('[ClaudeAgentRunner] App claude dir:', userClaudeDir);
-      log('[ClaudeAgentRunner] User working directory:', workingDir);
+      log('[CoworkAgentRunner] App agent dir:', userAgentDir);
+      log('[CoworkAgentRunner] User working directory:', workingDir);
 
       logTiming('before building conversation context', runStartTime);
 
       // pi-ai handles auth and model routing natively — no proxy, no env overrides needed.
-      logCtx('[ClaudeAgentRunner] Using pi-ai native routing for:', piModel.provider, piModel.id);
+      logCtx('[CoworkAgentRunner] Using pi-ai native routing for:', piModel.provider, piModel.id);
 
       // Resolve thinking level early — needed for session reuse check below
       const enableThinking = configStore.get('enableThinking') ?? false;
-      logCtx('[ClaudeAgentRunner] Enable thinking mode:', enableThinking);
+      logCtx('[CoworkAgentRunner] Enable thinking mode:', enableThinking);
       type PiThinkingLevel = 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh';
       const thinkingLevel: PiThinkingLevel = enableThinking ? 'medium' : 'off';
       const sessionRuntimeSignature = buildPiSessionRuntimeSignature({
@@ -1834,7 +1825,7 @@ ${hints.join('\n')}
       });
       const skillPaths = await this.resolveSkillPaths(session.id);
       const skillsSignature = JSON.stringify(skillPaths);
-      log('[ClaudeAgentRunner] Skill paths for pi ResourceLoader:', skillPaths);
+      log('[CoworkAgentRunner] Skill paths for pi ResourceLoader:', skillPaths);
 
       // Build contextual prompt — if reusing an existing SDK session, the SDK
       // already has conversation history so we only pass the new prompt.
@@ -1842,22 +1833,22 @@ ${hints.join('\n')}
       // a token-budgeted summary of recent history as a preamble.
       let cachedSession = this.piSessions.get(session.id);
       if (cachedSession && cachedSession.runtimeSignature !== sessionRuntimeSignature) {
-        logCtx('[ClaudeAgentRunner] Runtime changed, recreating cached pi session:', session.id);
+        logCtx('[CoworkAgentRunner] Runtime changed, recreating cached pi session:', session.id);
         try {
           cachedSession.session.dispose();
         } catch (disposeError) {
-          logWarn('[ClaudeAgentRunner] dispose error while recreating pi session:', disposeError);
+          logWarn('[CoworkAgentRunner] dispose error while recreating pi session:', disposeError);
         }
         this.piSessions.delete(session.id);
         cachedSession = undefined;
       }
       if (cachedSession && cachedSession.skillsSignature !== skillsSignature) {
-        logCtx('[ClaudeAgentRunner] Skills changed, recreating cached pi session:', session.id);
+        logCtx('[CoworkAgentRunner] Skills changed, recreating cached pi session:', session.id);
         try {
           cachedSession.session.dispose();
         } catch (disposeError) {
           logWarn(
-            '[ClaudeAgentRunner] dispose error while recreating pi session for skills:',
+            '[CoworkAgentRunner] dispose error while recreating pi session for skills:',
             disposeError
           );
         }
@@ -1930,7 +1921,7 @@ ${hints.join('\n')}
             const preamble = `<conversation_history>\n${historyNote}${historyItems.join('\n')}\n</conversation_history>`;
             contextualPrompt = `${preamble}\n\n${prompt}`;
             log(
-              '[ClaudeAgentRunner] Cold start: injecting',
+              '[CoworkAgentRunner] Cold start: injecting',
               historyItems.length,
               'of',
               historyMessages.length,
@@ -1946,7 +1937,7 @@ ${hints.join('\n')}
         }
       } else {
         // Reusing session — SDK already has the full conversation context
-        logCtx('[ClaudeAgentRunner] Reusing existing SDK session for:', session.id);
+        logCtx('[CoworkAgentRunner] Reusing existing SDK session for:', session.id);
       }
       if (extensionResult.promptPrefix?.trim()) {
         contextualPrompt = `${extensionResult.promptPrefix.trim()}\n\n${contextualPrompt}`;
@@ -1960,19 +1951,19 @@ ${hints.join('\n')}
       if (this.mcpManager) {
         const serverStatuses = this.mcpManager.getServerStatus();
         const connectedServers = serverStatuses.filter((s) => s.connected);
-        log('[ClaudeAgentRunner] MCP server statuses:', safeStringify(serverStatuses));
-        log('[ClaudeAgentRunner] Connected MCP servers:', connectedServers.length);
+        log('[CoworkAgentRunner] MCP server statuses:', safeStringify(serverStatuses));
+        log('[CoworkAgentRunner] Connected MCP servers:', connectedServers.length);
 
         let allConfigs: ReturnType<typeof mcpConfigStore.getEnabledServers> = [];
         try {
           allConfigs = mcpConfigStore.getEnabledServers();
           log(
-            '[ClaudeAgentRunner] Enabled MCP configs:',
+            '[CoworkAgentRunner] Enabled MCP configs:',
             allConfigs.map((c) => c.name)
           );
         } catch (error) {
           logWarn(
-            '[ClaudeAgentRunner] Failed to read enabled MCP configs; MCP tools will be unavailable this query',
+            '[CoworkAgentRunner] Failed to read enabled MCP configs; MCP tools will be unavailable this query',
             error
           );
           allConfigs = [];
@@ -1984,7 +1975,7 @@ ${hints.join('\n')}
         const mcpFingerprint = JSON.stringify(allConfigs) + String(imageCapable);
         if (this._mcpServersCache?.fingerprint === mcpFingerprint) {
           Object.assign(mcpServers, this._mcpServersCache.servers);
-          log('[ClaudeAgentRunner] MCP servers config reused from cache');
+          log('[CoworkAgentRunner] MCP servers config reused from cache');
         } else {
           // Use the module-level memoized helper — no more per-query fs.existsSync calls.
           const bundledNodePaths = getBundledNodePaths();
@@ -2011,7 +2002,7 @@ ${hints.join('\n')}
                   const currentPath = process.env.PATH || '';
                   // Prepend bundled node bin to PATH so npx can find node
                   serverEnv.PATH = `${nodeBinDir}${path.delimiter}${currentPath}`;
-                  log(`[ClaudeAgentRunner]   Added bundled node bin to PATH: ${nodeBinDir}`);
+                  log(`[CoworkAgentRunner]   Added bundled node bin to PATH: ${nodeBinDir}`);
                 }
 
                 if (!imageCapable) {
@@ -2054,19 +2045,19 @@ ${hints.join('\n')}
                   args: resolvedArgs,
                   env: serverEnv,
                 };
-                log(`[ClaudeAgentRunner] Added STDIO MCP server: ${serverKey}`);
-                log(`[ClaudeAgentRunner]   Command: ${command} ${resolvedArgs.join(' ')}`);
-                log(`[ClaudeAgentRunner]   Tools will be named: mcp__${serverKey}__<toolName>`);
+                log(`[CoworkAgentRunner] Added STDIO MCP server: ${serverKey}`);
+                log(`[CoworkAgentRunner]   Command: ${command} ${resolvedArgs.join(' ')}`);
+                log(`[CoworkAgentRunner]   Tools will be named: mcp__${serverKey}__<toolName>`);
               } else if (config.type === 'sse') {
                 mcpServers[serverKey] = {
                   type: 'sse',
                   url: config.url,
                   headers: config.headers || {},
                 };
-                log(`[ClaudeAgentRunner] Added SSE MCP server: ${serverKey}`);
+                log(`[CoworkAgentRunner] Added SSE MCP server: ${serverKey}`);
               }
             } catch (error) {
-              logError('[ClaudeAgentRunner] Failed to prepare MCP server config, skipping server', {
+              logError('[CoworkAgentRunner] Failed to prepare MCP server config, skipping server', {
                 serverId: config.id,
                 serverName: config.name,
                 error: toErrorText(error),
@@ -2093,9 +2084,9 @@ ${hints.join('\n')}
             envKeys: typedServerConfig.env ? Object.keys(typedServerConfig.env).length : 0,
           };
         });
-        log('[ClaudeAgentRunner] Final mcpServers summary:', safeStringify(mcpServersSummary, 2));
+        log('[CoworkAgentRunner] Final mcpServers summary:', safeStringify(mcpServersSummary, 2));
         if (process.env.COWORK_LOG_SDK_MESSAGES_FULL === '1') {
-          log('[ClaudeAgentRunner] Final mcpServers config:', safeStringify(mcpServers, 2));
+          log('[CoworkAgentRunner] Final mcpServers config:', safeStringify(mcpServers, 2));
         }
       }
       logTiming('after building MCP servers config', runStartTime);
@@ -2110,6 +2101,18 @@ This is an isolated sandbox environment. Use ${VIRTUAL_WORKSPACE_PATH} as the ro
             ? `<workspace_info>Your current workspace is: ${workingDir}</workspace_info>`
             : '';
 
+      // Build a concise summary of the agent's own runtime configuration.
+      // Intentionally excludes API keys, base URLs, and any other sensitive data.
+      const configSummaryPrompt = `<your_configuration>
+- Model: ${piModel.id}
+- Provider: ${provider}
+- Context Window: ${piModel.contextWindow || 'unknown'} tokens
+- Max Output Tokens: ${piModel.maxTokens || 'default'}
+- Thinking: ${enableThinking ? 'enabled' : 'disabled'}
+- Sandbox: ${runtimeConfig.sandboxEnabled ? 'enabled' : 'disabled'}
+- Memory: ${runtimeConfig.memoryEnabled ? 'enabled' : 'disabled'}
+</your_configuration>`;
+
       const coworkAppendPrompt = [
         'You are an Open Cowork assistant. Be concise, accurate, and tool-capable.',
         `CRITICAL BEHAVIORAL RULES:
@@ -2118,6 +2121,7 @@ This is an isolated sandbox environment. Use ${VIRTUAL_WORKSPACE_PATH} as the ro
 3. For relative time windows like "within two days" in browsing or research tasks, assume the most recent two relevant publication days unless the user explicitly defines another date range.
 4. For bracketed placeholders like [Agent], [Topic], etc., treat the word inside brackets as the literal search keyword unless the user says otherwise.
 5. When given a task, START DOING IT. Do not restate the task, do not list what you will do, do not ask for confirmation. Just execute.`,
+        configSummaryPrompt,
         workspaceInfoPrompt,
         `<citation_requirements>
 If your answer uses linkable content from MCP tools, include a "Sources:" section and otherwise use standard Markdown links: [Title](https://claude.ai/chat/URL).
@@ -2142,13 +2146,13 @@ Tool routing:
       const customTools = [...mcpCustomTools, ...extensionCustomTools];
       if (mcpCustomTools.length > 0) {
         log(
-          `[ClaudeAgentRunner] Registered ${mcpCustomTools.length} MCP tools as customTools:`,
+          `[CoworkAgentRunner] Registered ${mcpCustomTools.length} MCP tools as customTools:`,
           mcpCustomTools.map((t) => t.name).join(', ')
         );
       }
       if (extensionCustomTools.length > 0) {
         log(
-          `[ClaudeAgentRunner] Registered ${extensionCustomTools.length} extension tools as customTools:`,
+          `[CoworkAgentRunner] Registered ${extensionCustomTools.length} extension tools as customTools:`,
           extensionCustomTools.map((t) => t.name).join(', ')
         );
       }
@@ -2165,7 +2169,7 @@ Tool routing:
       );
 
       // Inject a default 120s timeout for bash commands when the model omits one
-      const withTimeout = ClaudeAgentRunner.wrapBashToolWithDefaultTimeout(
+      const withTimeout = CoworkAgentRunner.wrapBashToolWithDefaultTimeout(
         codingTools as ToolDefinition[]
       );
 
@@ -2176,13 +2180,13 @@ Tool routing:
       const wrappedTools = this.wrapBashToolForSudo(withTimeout, session.id, effectiveCwd);
 
       // Diagnostic: log tools being passed to SDK (helps debug Ollama tool use)
-      logCtx(`[ClaudeAgentRunner] Session reuse check: cached=${!!cachedSession}`);
-      logCtx(`[ClaudeAgentRunner] Model=${piModel.id}, thinkingLevel=${thinkingLevel}`);
+      logCtx(`[CoworkAgentRunner] Session reuse check: cached=${!!cachedSession}`);
+      logCtx(`[CoworkAgentRunner] Model=${piModel.id}, thinkingLevel=${thinkingLevel}`);
       log(
-        `[ClaudeAgentRunner] Built-in tools (${wrappedTools.length}): ${wrappedTools.map((t: { name?: string; type?: string }) => t.name || t.type).join(', ')}`
+        `[CoworkAgentRunner] Built-in tools (${wrappedTools.length}): ${wrappedTools.map((t: { name?: string; type?: string }) => t.name || t.type).join(', ')}`
       );
       log(
-        `[ClaudeAgentRunner] Custom tools (${customTools.length}): ${customTools.map((t) => t.name).join(', ')}`
+        `[CoworkAgentRunner] Custom tools (${customTools.length}): ${customTools.map((t) => t.name).join(', ')}`
       );
 
       let piSession: PiAgentSession;
@@ -2193,7 +2197,7 @@ Tool routing:
         // Hot-swap model/thinking if changed — SDK supports this natively
         if (cachedSession.modelId !== piModel.id) {
           logCtx(
-            '[ClaudeAgentRunner] Model changed, hot-swapping:',
+            '[CoworkAgentRunner] Model changed, hot-swapping:',
             cachedSession.modelId,
             '→',
             piModel.id
@@ -2204,14 +2208,14 @@ Tool routing:
           if (cachedSession.ollamaNumCtx) {
             cachedSession.ollamaNumCtx.value = piModel.contextWindow || 128000;
             log(
-              '[ClaudeAgentRunner] Updated Ollama num_ctx on hot-swap:',
+              '[CoworkAgentRunner] Updated Ollama num_ctx on hot-swap:',
               cachedSession.ollamaNumCtx.value
             );
           }
         }
         if (cachedSession.thinkingLevel !== thinkingLevel) {
           logCtx(
-            '[ClaudeAgentRunner] Thinking level changed, hot-swapping:',
+            '[CoworkAgentRunner] Thinking level changed, hot-swapping:',
             cachedSession.thinkingLevel,
             '→',
             thinkingLevel
@@ -2220,18 +2224,37 @@ Tool routing:
           cachedSession.thinkingLevel = thinkingLevel;
         }
 
-        logCtx('[ClaudeAgentRunner] Reusing cached pi session for:', session.id);
+        logCtx('[CoworkAgentRunner] Reusing cached pi session for:', session.id);
         logTiming('agent session reused', runStartTime);
       } else {
         // First query in this session — create new agent session
-        // ResourceLoader + ModelRegistry only needed for session creation — skip on reuse
         const { DefaultResourceLoader, getAgentDir } =
           await import('@earendil-works/pi-coding-agent');
+
+        // Per-session compaction instructions (from session metadata if present).
+        // Capped at 2000 chars to limit prompt injection surface — this field
+        // is only set programmatically (not from external user input).
+        let sessionCompactInstructions: string | undefined =
+          'compactInstructions' in session &&
+          typeof (session as Record<string, unknown>).compactInstructions === 'string'
+            ? ((session as Record<string, unknown>).compactInstructions as string)
+            : undefined;
+        if (sessionCompactInstructions && sessionCompactInstructions.length > 2000) {
+          sessionCompactInstructions = sessionCompactInstructions.slice(0, 2000);
+        }
+
         const resourceLoader = new DefaultResourceLoader({
           cwd: effectiveCwd,
           agentDir: getAgentDir(),
           additionalSkillPaths: skillPaths,
-          appendSystemPrompt: [coworkAppendPrompt],
+          appendSystemPrompt: coworkAppendPrompt,
+          extensionFactories: [
+            createCompactionExtensionFactory({
+              customInstructions: sessionCompactInstructions,
+              pruneToolOutputAbove: 500,
+              keepRecentToolResults: 3,
+            }),
+          ],
         });
         await resourceLoader.reload();
 
@@ -2246,7 +2269,7 @@ Tool routing:
           // Very small context: disable compaction (weak models produce unreliable summaries)
           compactionSettings = { enabled: false };
           log(
-            '[ClaudeAgentRunner] Ollama small context model, disabling auto-compaction (contextWindow:',
+            '[CoworkAgentRunner] Ollama small context model, disabling auto-compaction (contextWindow:',
             contextWindow,
             ')'
           );
@@ -2258,7 +2281,7 @@ Tool routing:
             keepRecentTokens: Math.floor(contextWindow * 0.25),
           };
           log(
-            '[ClaudeAgentRunner] Ollama medium context, scaled compaction:',
+            '[CoworkAgentRunner] Ollama medium context, scaled compaction:',
             JSON.stringify(compactionSettings)
           );
         } else {
@@ -2286,7 +2309,7 @@ Tool routing:
         this.installPermissionHook(piSession, session.id);
 
         // Store session for reuse — evict oldest if cache is full
-        if (this.piSessions.size >= ClaudeAgentRunner.MAX_CACHED_SESSIONS) {
+        if (this.piSessions.size >= CoworkAgentRunner.MAX_CACHED_SESSIONS) {
           const oldestKey = this.piSessions.keys().next().value;
           if (oldestKey) {
             const oldest = this.piSessions.get(oldestKey);
@@ -2294,11 +2317,11 @@ Tool routing:
               try {
                 oldest.session.dispose();
               } catch (e) {
-                logWarn('[ClaudeAgentRunner] dispose error on eviction:', e);
+                logWarn('[CoworkAgentRunner] dispose error on eviction:', e);
               }
             }
             this.piSessions.delete(oldestKey);
-            log('[ClaudeAgentRunner] Evicted oldest cached session:', oldestKey);
+            log('[CoworkAgentRunner] Evicted oldest cached session:', oldestKey);
           }
         }
         this.piSessions.set(session.id, {
@@ -2316,7 +2339,7 @@ Tool routing:
           // Guard: only patch if the SDK exposes _onPayload (private API)
           if (!('_onPayload' in agent)) {
             logWarn(
-              '[ClaudeAgentRunner] SDK agent does not expose _onPayload — skipping Ollama num_ctx patch'
+              '[CoworkAgentRunner] SDK agent does not expose _onPayload — skipping Ollama num_ctx patch'
             );
           } else {
             const originalOnPayload = agent._onPayload as
@@ -2337,7 +2360,7 @@ Tool routing:
             };
             this.piSessions.get(session.id)!.ollamaNumCtx = ollamaNumCtx;
             log(
-              '[ClaudeAgentRunner] Ollama _onPayload wrapper installed, num_ctx:',
+              '[CoworkAgentRunner] Ollama _onPayload wrapper installed, num_ctx:',
               ollamaNumCtx.value
             );
           } // end else (_onPayload exists)
@@ -2353,7 +2376,6 @@ Tool routing:
       let compactionStepId: string | undefined;
       let hasEmittedError = false;
       let terminalErrorText: string | undefined;
-      const thinkParser = new ThinkTagStreamParser();
       const promptStartedAt = Date.now();
       const streamEventCounts = new Map<string, number>();
 
@@ -2447,7 +2469,7 @@ Tool routing:
         });
         if (provider === 'ollama') {
           log(
-            '[ClaudeAgentRunner] Ollama first stream event received',
+            '[CoworkAgentRunner] Ollama first stream event received',
             safeStringify({
               sessionId: session.id,
               eventType,
@@ -2466,7 +2488,7 @@ Tool routing:
       const resetActivityTimeout = () => {
         if (activityTimeoutId) clearTimeout(activityTimeoutId);
         activityTimeoutId = setTimeout(() => {
-          logWarn('[ClaudeAgentRunner] Prompt timed out (no activity for 5 min), aborting');
+          logWarn('[CoworkAgentRunner] Prompt timed out (no activity for 5 min), aborting');
           abortedByTimeout = true;
           controller.abort();
         }, PROMPT_TIMEOUT_MS);
@@ -2483,6 +2505,50 @@ Tool routing:
           )
         );
 
+      const emitTerminalError = (errorText: string, options: { abort?: boolean } = {}): void => {
+        terminalErrorText = errorText;
+
+        const emission = buildTerminalErrorEmissionDetails({
+          errorText,
+          streamedText,
+        });
+
+        const partialText = emission.partialText ? sanitizeOutputPaths(emission.partialText) : '';
+        const messageText = buildTerminalErrorMessage(errorText, partialText);
+        streamedText = '';
+        this.sendToRenderer({
+          type: 'stream.partial',
+          payload: { sessionId: session.id, delta: '' },
+        });
+
+        if (!hasEmittedError) {
+          hasEmittedError = true;
+          this.sendMessage(session.id, {
+            id: uuidv4(),
+            sessionId: session.id,
+            role: 'assistant',
+            content: [{ type: 'text', text: messageText }],
+            timestamp: Date.now(),
+          });
+        }
+
+        this.sendTraceUpdate(session.id, thinkingStepId, {
+          status: 'error',
+          title: 'Request failed',
+        });
+
+        if (options.abort && !controller.signal.aborted) {
+          try {
+            // Mark BEFORE calling abort() so AbortError handling preserves the
+            // 'Request failed' state instead of treating this as a user cancel.
+            abortedByStreamError = true;
+            controller.abort();
+          } catch (abortErr) {
+            logWarn('[CoworkAgentRunner] stream-error abort failed:', abortErr);
+          }
+        }
+      };
+
       const unsubscribe = piSession.subscribe((event) => {
         try {
           if (controller.signal.aborted) return;
@@ -2494,16 +2560,16 @@ Tool routing:
             const updateType = event.assistantMessageEvent.type;
             recordStreamEvent(updateType);
             if (updateType !== 'text_delta' && updateType !== 'thinking_delta') {
-              log(`[ClaudeAgentRunner] Event: ${event.type} → ${updateType}`);
+              log(`[CoworkAgentRunner] Event: ${event.type} → ${updateType}`);
             }
           } else if (event.type === 'message_start') {
             log(
-              '[ClaudeAgentRunner] Event: message_start',
+              '[CoworkAgentRunner] Event: message_start',
               safeStringify(summarizeMessageForLog(event.message), 2)
             );
           } else if (event.type === 'message_end') {
             log(
-              '[ClaudeAgentRunner] Event: message_end',
+              '[CoworkAgentRunner] Event: message_end',
               safeStringify(
                 {
                   message: summarizeMessageForLog(event.message),
@@ -2513,9 +2579,9 @@ Tool routing:
               )
             );
           } else if (event.type === 'turn_end') {
-            log(`[ClaudeAgentRunner] Event: ${event.type}`);
+            log(`[CoworkAgentRunner] Event: ${event.type}`);
           } else {
-            log(`[ClaudeAgentRunner] Event: ${event.type}`);
+            log(`[CoworkAgentRunner] Event: ${event.type}`);
           }
 
           switch (event.type) {
@@ -2524,17 +2590,8 @@ Tool routing:
               const ame = event.assistantMessageEvent;
               if (ame.type === 'text_delta') {
                 markFirstStreamEvent(ame.type);
-                const parsed = thinkParser.push(ame.delta);
-                if (parsed.thinking) {
-                  this.sendToRenderer({
-                    type: 'stream.thinking',
-                    payload: { sessionId: session.id, delta: parsed.thinking },
-                  });
-                }
-                if (parsed.text) {
-                  streamedText += parsed.text;
-                  this.sendPartial(session.id, parsed.text);
-                }
+                streamedText += ame.delta;
+                this.sendPartial(session.id, ame.delta);
               } else if (ame.type === 'thinking_delta') {
                 markFirstStreamEvent(ame.type);
                 // Forward thinking delta to renderer for real-time display
@@ -2564,10 +2621,12 @@ Tool routing:
               } else if (ame.type === 'done') {
                 // Some providers emit 'done' via message_update — we handle it
                 // in message_end below as a unified path for all providers.
-                log('[ClaudeAgentRunner] message_update done event (handled in message_end)');
+                log('[CoworkAgentRunner] message_update done event (handled in message_end)');
               } else if (ame.type === 'error') {
+                markFirstStreamEvent(ame.type);
                 const errorDetail = JSON.stringify(ame.error?.content || 'no content');
-                logCtxError('[ClaudeAgentRunner] pi-ai stream error:', ame.reason, errorDetail);
+                logCtxError('[CoworkAgentRunner] pi-ai stream error:', ame.reason, errorDetail);
+                emitTerminalError(resolveAssistantStreamErrorText(ame), { abort: true });
               }
               break;
             }
@@ -2577,22 +2636,9 @@ Tool routing:
               // Works for all providers (some emit 'done' via message_update, others don't).
               if (controller.signal.aborted) break;
 
-              // Flush any buffered content from the think-tag parser
-              const flushed = thinkParser.flush();
-              if (flushed.thinking) {
-                this.sendToRenderer({
-                  type: 'stream.thinking',
-                  payload: { sessionId: session.id, delta: flushed.thinking },
-                });
-              }
-              if (flushed.text) {
-                streamedText += flushed.text;
-                this.sendPartial(session.id, flushed.text);
-              }
-
               const msg = event.message;
               if (process.env.COWORK_LOG_SDK_MESSAGES_FULL === '1') {
-                log('[ClaudeAgentRunner] message_end raw message:', safeStringify(msg, 2));
+                log('[CoworkAgentRunner] message_end raw message:', safeStringify(msg, 2));
               }
               const resolvedPayload = resolveMessageEndPayload({
                 message: msg as Parameters<typeof resolveMessageEndPayload>[0]['message'],
@@ -2601,7 +2647,7 @@ Tool routing:
               streamedText = resolvedPayload.nextStreamedText;
               if (provider === 'ollama') {
                 log(
-                  '[ClaudeAgentRunner] Ollama message_end diagnostics',
+                  '[CoworkAgentRunner] Ollama message_end diagnostics',
                   safeStringify({
                     sessionId: session.id,
                     modelId: piModel.id,
@@ -2620,26 +2666,7 @@ Tool routing:
                 );
               }
               if (resolvedPayload.errorText) {
-                terminalErrorText = resolvedPayload.errorText;
-                if (!hasEmittedError) {
-                  hasEmittedError = true;
-                  this.sendMessage(session.id, {
-                    id: uuidv4(),
-                    sessionId: session.id,
-                    role: 'assistant',
-                    content: [
-                      {
-                        type: 'text',
-                        text: `**Error**: ${resolvedPayload.errorText}\n\n${
-                          /\b4\d{2}\b/.test(resolvedPayload.errorText)
-                            ? '_请检查配置后重试。_'
-                            : '_Agent 正在自动重试，请稍候..._'
-                        }`,
-                      },
-                    ],
-                    timestamp: Date.now(),
-                  });
-                }
+                emitTerminalError(resolvedPayload.errorText);
                 break;
               }
               if (resolvedPayload.shouldEmitMessage) {
@@ -2673,7 +2700,7 @@ Tool routing:
                   } else {
                     // Unknown block type — pass through as text so content isn't silently lost
                     const unknownBlock = block as { type?: string; text?: string };
-                    log(`[ClaudeAgentRunner] Unknown content block type: ${unknownBlock.type}`);
+                    log(`[CoworkAgentRunner] Unknown content block type: ${unknownBlock.type}`);
                     const text = unknownBlock.text || JSON.stringify(block);
                     if (text) contentBlocks.push({ type: 'text', text });
                   }
@@ -2707,7 +2734,7 @@ Tool routing:
                   const tokenUsage = normalizeTokenUsage(msgWithUsage.usage);
                   if (msgWithUsage.usage) {
                     log(
-                      '[ClaudeAgentRunner] normalized usage:',
+                      '[CoworkAgentRunner] normalized usage:',
                       safeStringify(
                         {
                           raw: msgWithUsage.usage,
@@ -2735,7 +2762,7 @@ Tool routing:
             }
 
             case 'tool_execution_start': {
-              logCtx(`[ClaudeAgentRunner] Tool execution start: ${event.toolName}`);
+              logCtx(`[CoworkAgentRunner] Tool execution start: ${event.toolName}`);
               // ── Loop guard layer 2: per-tool cumulative frequency ──
               handleLoopGuardDecision(
                 loopGuard.recordToolInvocation(event.toolName),
@@ -2781,12 +2808,13 @@ Tool routing:
             }
 
             case 'agent_end': {
-              logCtx('[ClaudeAgentRunner] Agent finished');
+              logCtx('[CoworkAgentRunner] Agent finished');
               break;
             }
 
-            case 'compaction_start': {
-              log('[ClaudeAgentRunner] Auto-compaction started, reason:', event.reason);
+            case 'compaction_start':
+            case 'auto_compaction_start': {
+              log('[CoworkAgentRunner] Auto-compaction started, reason:', event.reason);
               compactionStepId = `compaction-${Date.now()}`;
               this.sendTraceStep(session.id, {
                 id: compactionStepId,
@@ -2806,11 +2834,38 @@ Tool routing:
                   ? `Context compaction failed: ${event.errorMessage}`
                   : 'Context compaction completed';
               log(
-                '[ClaudeAgentRunner] Auto-compaction ended:',
+                '[CoworkAgentRunner] Auto-compaction ended:',
                 title,
                 'willRetry:',
                 event.willRetry
               );
+
+              // Surface compaction result details to the renderer (skip if retrying)
+              if (event.result && !event.willRetry) {
+                const compactionDetails = event.result.details as
+                  | { readFiles?: string[]; modifiedFiles?: string[] }
+                  | undefined;
+                this.sendToRenderer({
+                  type: 'compaction.result',
+                  payload: {
+                    sessionId: session.id,
+                    summary: event.result.summary,
+                    tokensBefore: event.result.tokensBefore,
+                    readFiles: compactionDetails?.readFiles || [],
+                    modifiedFiles: compactionDetails?.modifiedFiles || [],
+                  },
+                });
+                log(
+                  '[CoworkAgentRunner] Compaction result surfaced:',
+                  JSON.stringify({
+                    summaryLen: event.result.summary.length,
+                    tokensBefore: event.result.tokensBefore,
+                    readFiles: compactionDetails?.readFiles?.length || 0,
+                    modifiedFiles: compactionDetails?.modifiedFiles?.length || 0,
+                  })
+                );
+              }
+
               if (compactionStepId) {
                 this.sendTraceUpdate(session.id, compactionStepId, { status, title });
                 compactionStepId = undefined;
@@ -2828,7 +2883,7 @@ Tool routing:
             }
           }
         } catch (subscribeErr) {
-          logError('[ClaudeAgentRunner] Error in subscribe callback:', subscribeErr);
+          logError('[CoworkAgentRunner] Error in subscribe callback:', subscribeErr);
           if (compactionStepId) {
             this.sendTraceUpdate(session.id, compactionStepId, {
               status: 'error',
@@ -2855,7 +2910,7 @@ Tool routing:
         resetActivityTimeout();
         if (provider === 'ollama') {
           log(
-            '[ClaudeAgentRunner] Starting Ollama prompt',
+            '[CoworkAgentRunner] Starting Ollama prompt',
             safeStringify({
               sessionId: session.id,
               modelId: piModel.id,
@@ -2869,14 +2924,14 @@ Tool routing:
         }
         const promptResult = await piSession.prompt(contextualPrompt);
         log(
-          '[ClaudeAgentRunner] prompt() returned:',
+          '[CoworkAgentRunner] prompt() returned:',
           JSON.stringify(promptResult ?? 'void').substring(0, 1000)
         );
       } finally {
         try {
           unsubscribe();
         } catch (e) {
-          logWarn('[ClaudeAgentRunner] unsubscribe error:', e);
+          logWarn('[CoworkAgentRunner] unsubscribe error:', e);
         }
         if (activityTimeoutId) clearTimeout(activityTimeoutId);
         if (ollamaColdStartTimerId) clearTimeout(ollamaColdStartTimerId);
@@ -2886,7 +2941,7 @@ Tool routing:
 
       // If the SDK swallowed the AbortError and returned void, detect timeout here
       if (controller.signal.aborted && abortedByTimeout) {
-        logCtx('[ClaudeAgentRunner] Aborted due to timeout (detected after prompt returned)');
+        logCtx('[CoworkAgentRunner] Aborted due to timeout (detected after prompt returned)');
         const errorMsg: Message = {
           id: uuidv4(),
           sessionId: session.id,
@@ -2905,8 +2960,15 @@ Tool routing:
       // the 'error' trace status that handleLoopGuardDecision already published.
       // The user-facing message and trace step are already set; do not overwrite
       // them with the default "Task completed" below.
-      if (controller.signal.aborted && abortedByLoopGuard) {
-        logCtx('[ClaudeAgentRunner] Aborted by loop guard (detected after prompt returned)');
+      const abortDisposition = resolveAbortDisposition({
+        abortedByTimeout,
+        abortedByLoopGuard,
+        abortedByStreamError,
+      });
+      if (controller.signal.aborted && shouldPreserveExistingTrace(abortDisposition)) {
+        logCtx(
+          `[CoworkAgentRunner] Aborted by ${abortDisposition === 'loop_guard' ? 'loop guard' : 'stream error'} (detected after prompt returned)`
+        );
         return;
       }
       // Complete - update the initial thinking step
@@ -2916,8 +2978,13 @@ Tool routing:
       });
     } catch (error) {
       if (error instanceof Error && error.name === 'AbortError') {
-        if (abortedByTimeout) {
-          logCtx('[ClaudeAgentRunner] Aborted due to timeout');
+        const abortDisposition = resolveAbortDisposition({
+          abortedByTimeout,
+          abortedByLoopGuard,
+          abortedByStreamError,
+        });
+        if (abortDisposition === 'timeout') {
+          logCtx('[CoworkAgentRunner] Aborted due to timeout');
           const errorMsg: Message = {
             id: uuidv4(),
             sessionId: session.id,
@@ -2930,20 +2997,24 @@ Tool routing:
             status: 'error',
             title: 'Request timed out',
           });
-        } else if (abortedByLoopGuard) {
+        } else if (abortDisposition === 'loop_guard') {
           // Loop guard already published the user-facing assistant message and
           // an 'error' trace step with the loop-detected title. Do NOT overwrite
           // them here with a 'completed/Cancelled' state.
-          logCtx('[ClaudeAgentRunner] Aborted by loop guard');
+          logCtx('[CoworkAgentRunner] Aborted by loop guard');
+        } else if (abortDisposition === 'stream_error') {
+          // Stream-error handling already published the user-facing assistant
+          // message and the 'Request failed' trace state. Preserve them.
+          logCtx('[CoworkAgentRunner] Aborted by stream error');
         } else {
-          logCtx('[ClaudeAgentRunner] Aborted by user');
+          logCtx('[CoworkAgentRunner] Aborted by user');
           this.sendTraceUpdate(session.id, thinkingStepId, {
             status: 'completed',
             title: 'Cancelled',
           });
         }
       } else {
-        logCtxError('[ClaudeAgentRunner] Error:', error);
+        logCtxError('[CoworkAgentRunner] Error:', error);
 
         const errorText = toUserFacingErrorText(toErrorText(error));
         const errorMsg: Message = {
@@ -2978,25 +3049,25 @@ Tool routing:
           const sandbox = getSandboxAdapter();
 
           if (sandbox.isWSL) {
-            log('[ClaudeAgentRunner] Syncing sandbox changes to Windows...');
+            log('[CoworkAgentRunner] Syncing sandbox changes to Windows...');
             const syncResult = await SandboxSync.syncToWindows(session.id);
             if (syncResult.success) {
-              log('[ClaudeAgentRunner] Sync completed successfully');
+              log('[CoworkAgentRunner] Sync completed successfully');
             } else {
-              logError('[ClaudeAgentRunner] Sync failed:', syncResult.error);
+              logError('[CoworkAgentRunner] Sync failed:', syncResult.error);
             }
           } else if (sandbox.isLima) {
-            log('[ClaudeAgentRunner] Syncing sandbox changes to macOS...');
+            log('[CoworkAgentRunner] Syncing sandbox changes to macOS...');
             const { LimaSync } = await import('../sandbox/lima-sync');
             const syncResult = await LimaSync.syncToMac(session.id);
             if (syncResult.success) {
-              log('[ClaudeAgentRunner] Sync completed successfully');
+              log('[CoworkAgentRunner] Sync completed successfully');
             } else {
-              logError('[ClaudeAgentRunner] Sync failed:', syncResult.error);
+              logError('[CoworkAgentRunner] Sync failed:', syncResult.error);
             }
           }
         } catch (syncErr) {
-          logError('[ClaudeAgentRunner] Sandbox sync error:', syncErr);
+          logError('[CoworkAgentRunner] Sandbox sync error:', syncErr);
           this.sendMessage(session.id, {
             id: uuidv4(),
             sessionId: session.id,
@@ -3011,6 +3082,80 @@ Tool routing:
           });
         }
       }
+    }
+  }
+
+  /**
+   * Manually trigger context compaction for a session.
+   * Delegates to the SDK's AgentSession.compact() method.
+   *
+   * @returns CompactionResult if successful, null if no session cached
+   */
+  async compact(
+    sessionId: string,
+    customInstructions?: string
+  ): Promise<{
+    summary: string;
+    firstKeptEntryId: string;
+    tokensBefore: number;
+    details?: unknown;
+  } | null> {
+    const cached = this.piSessions.get(sessionId);
+    if (!cached) {
+      logWarn('[CoworkAgentRunner] No cached pi session for compact:', sessionId);
+      return null;
+    }
+    log('[CoworkAgentRunner] Manual compact triggered for session:', sessionId);
+    try {
+      const result = await cached.session.compact(customInstructions);
+      log(
+        '[CoworkAgentRunner] Manual compact completed:',
+        JSON.stringify({
+          summaryLen: result.summary.length,
+          tokensBefore: result.tokensBefore,
+        })
+      );
+      const compactionDetails = result.details as
+        | { readFiles?: string[]; modifiedFiles?: string[] }
+        | undefined;
+      this.sendToRenderer({
+        type: 'compaction.result',
+        payload: {
+          sessionId,
+          summary: result.summary,
+          tokensBefore: result.tokensBefore,
+          isManual: true,
+          readFiles: compactionDetails?.readFiles || [],
+          modifiedFiles: compactionDetails?.modifiedFiles || [],
+        },
+      });
+      return result;
+    } catch (err) {
+      logError('[CoworkAgentRunner] compact error:', err);
+      return null;
+    }
+  }
+
+  /**
+   * Get current context usage for a session.
+   * Delegates to the SDK's AgentSession.getContextUsage() method.
+   *
+   * @returns ContextUsage { tokens, contextWindow, percent } or null
+   */
+  getContextUsage(
+    sessionId: string
+  ): { tokens: number | null; contextWindow: number; percent: number | null } | null {
+    const cached = this.piSessions.get(sessionId);
+    if (!cached) {
+      return null;
+    }
+    try {
+      const usage = cached.session.getContextUsage();
+      log('[CoworkAgentRunner] getContextUsage:', sessionId, JSON.stringify(usage));
+      return usage ?? null;
+    } catch (err) {
+      logError('[CoworkAgentRunner] getContextUsage error:', err);
+      return null;
     }
   }
 

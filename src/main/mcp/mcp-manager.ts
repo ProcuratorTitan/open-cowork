@@ -11,14 +11,18 @@
  *
  * Dependencies: config-store (via mcp-config-store)
  */
-import { Client } from '@modelcontextprotocol/sdk/client/index.js';
-import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
-import { SSEClientTransport } from '@modelcontextprotocol/sdk/client/sse.js';
-import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
+import {
+  Client,
+  SSEClientTransport,
+  StreamableHTTPClientTransport,
+  type Tool,
+} from '@modelcontextprotocol/client';
+import { StdioClientTransport } from '@modelcontextprotocol/client/stdio';
 import { createHash } from 'crypto';
-import { app, BrowserWindow } from 'electron';
+import { app, BrowserWindow, shell } from 'electron';
 
 import path from 'path';
+import { connectWithOAuthRetry, OpenCoworkMcpOAuthProvider } from './mcp-oauth';
 import { log, logError, logWarn, logCtx, logCtxError, logTiming } from '../utils/logger';
 import { getDefaultShell } from '../utils/shell-resolver';
 
@@ -28,6 +32,8 @@ const MCP_TOOL_CALL_TIMEOUT_MS = 5 * 60 * 1000;
 type RefreshToolsResult =
   | { kind: 'success'; serverId: string; tools: MCPTool[] }
   | { kind: 'error'; serverId: string; error: unknown };
+
+type MCPTransport = StdioClientTransport | SSEClientTransport | StreamableHTTPClientTransport;
 
 /**
  * MCP Server Configuration
@@ -52,11 +58,9 @@ export interface MCPTool {
   name: string;
   originalName?: string;
   description: string;
-  inputSchema: {
-    type: string;
-    properties: Record<string, unknown>;
-    required?: string[];
-  };
+  inputSchema: Tool['inputSchema'];
+  outputSchema?: Tool['outputSchema'];
+  toolDefinition: Tool;
   serverId: string;
   serverName: string;
 }
@@ -153,7 +157,6 @@ async function raceWithTimeout<T>(
   }
 }
 
-
 function getTrustedWindowsNpxDirectories(
   env: Record<string, string | undefined> = process.env
 ): string[] {
@@ -220,12 +223,11 @@ export function findPreferredWindowsNpxPath(
  */
 export class MCPManager {
   private clients: Map<string, Client> = new Map();
-  private transports: Map<
-    string,
-    StdioClientTransport | SSEClientTransport | StreamableHTTPClientTransport
-  > = new Map();
+  private transports: Map<string, MCPTransport> = new Map();
   private tools: Map<string, MCPTool> = new Map(); // toolName -> MCPTool
   private serverConfigs: Map<string, MCPServerConfig> = new Map();
+  private oauthProviders: Map<string, { provider: OpenCoworkMcpOAuthProvider; serverUrl: string }> =
+    new Map();
   private npxPath: string | null = null; // Cached npx path
   // Fingerprint of last initialized config to skip redundant re-init
   private lastConfigFingerprint: string | null = null;
@@ -644,6 +646,7 @@ export class MCPManager {
     this.lastConfigFingerprint = null;
     await this.disconnectServer(serverId);
     this.serverConfigs.delete(serverId);
+    this.oauthProviders.delete(serverId);
     await this.refreshTools();
   }
 
@@ -749,9 +752,26 @@ export class MCPManager {
    * connectionStatus is always set to 'connected' or 'failed'.
    */
   private async connectServerInternal(config: MCPServerConfig): Promise<void> {
-    let transport: StdioClientTransport | SSEClientTransport | StreamableHTTPClientTransport;
+    let transport: MCPTransport;
     let commandForLogging = '';
     let argsForLogging: string[] = [];
+    const connectTimeoutMs = 30000;
+
+    // Create MCP client before transport connect so streamable HTTP OAuth retries
+    // can reuse the same client instance across the initial unauthorized response
+    // and the authenticated reconnect.
+    const client = new Client(
+      {
+        name: 'open-cowork',
+        version: '0.1.0',
+      },
+      {
+        capabilities: {},
+        versionNegotiation: {
+          mode: 'auto',
+        },
+      }
+    );
 
     if (config.type === 'stdio') {
       if (!config.command) {
@@ -967,46 +987,25 @@ export class MCPManager {
       if (config.headers && Object.keys(config.headers).length > 0) {
         requestInit.headers = config.headers;
       }
-      transport = new StreamableHTTPClientTransport(httpUrl, { requestInit });
+
+      const authProvider = this.getOrCreateStreamableHttpOAuthProvider(config);
+      transport = await connectWithOAuthRetry<StreamableHTTPClientTransport>({
+        connect: async (streamableTransport: StreamableHTTPClientTransport) => {
+          await this.connectClientWithTimeout(client, streamableTransport, connectTimeoutMs);
+        },
+        createTransport: (provider) =>
+          new StreamableHTTPClientTransport(httpUrl, { authProvider: provider, requestInit }),
+        provider: authProvider,
+      });
     } else {
       throw new Error(`Unsupported transport type: ${config.type}`);
     }
 
-    // Create MCP client
-    const client = new Client(
-      {
-        name: 'open-cowork',
-        version: '0.1.0',
-      },
-      {
-        capabilities: {},
-      }
-    );
-
     log(`[MCPManager] MCP client created, attempting to connect...`);
 
     try {
-      // Connect with timeout to prevent hanging indefinitely (e.g. npx download stalls)
-      const connectTimeoutMs = 30000; // 30 second timeout
-      const connectPromise = client.connect(transport);
-      let connectTimeoutId: ReturnType<typeof setTimeout>;
-      const connectTimeoutPromise = new Promise<never>((_, reject) => {
-        connectTimeoutId = setTimeout(
-          () =>
-            reject(new Error(`MCP server connection timed out after ${connectTimeoutMs / 1000}s`)),
-          connectTimeoutMs
-        );
-      });
-
-      try {
-        await Promise.race([connectPromise, connectTimeoutPromise]);
-        clearTimeout(connectTimeoutId!);
-      } catch (error) {
-        clearTimeout(connectTimeoutId!);
-        // Prevent UnhandledPromiseRejection from the orphaned connectPromise
-        // when timeout wins the race and transport is closed beneath it.
-        connectPromise.catch(() => {});
-        throw error;
+      if (config.type !== 'streamable-http') {
+        await this.connectClientWithTimeout(client, transport, connectTimeoutMs);
       }
       log(`[MCPManager] Client.connect() completed successfully`);
 
@@ -1096,6 +1095,70 @@ export class MCPManager {
     if (config.name.toLowerCase().includes('chrome')) {
       await this.ensureChromeReady(config.id, config.name, client);
     }
+  }
+
+  private async connectClientWithTimeout(
+    client: Client,
+    transport: MCPTransport,
+    timeoutMs: number
+  ): Promise<void> {
+    const connectPromise = client.connect(transport);
+    let connectTimeoutId: ReturnType<typeof setTimeout>;
+    const connectTimeoutPromise = new Promise<never>((_, reject) => {
+      connectTimeoutId = setTimeout(
+        () => reject(new Error(`MCP server connection timed out after ${timeoutMs / 1000}s`)),
+        timeoutMs
+      );
+    });
+
+    try {
+      await Promise.race([connectPromise, connectTimeoutPromise]);
+      clearTimeout(connectTimeoutId!);
+    } catch (error) {
+      clearTimeout(connectTimeoutId!);
+      // Prevent UnhandledPromiseRejection from the orphaned connectPromise
+      // when timeout wins the race and transport is closed beneath it.
+      connectPromise.catch(() => {});
+      throw error;
+    }
+  }
+
+  private getOrCreateStreamableHttpOAuthProvider(
+    config: MCPServerConfig
+  ): OpenCoworkMcpOAuthProvider {
+    if (!config.url) {
+      throw new Error(`Streamable HTTP server ${config.name} requires a URL`);
+    }
+
+    const existing = this.oauthProviders.get(config.id);
+    if (existing && existing.serverUrl === config.url) {
+      return existing.provider;
+    }
+
+    const provider = new OpenCoworkMcpOAuthProvider({
+      openExternal: async (url) => {
+        await this.openMcpAuthorizationUrl(config.name, url);
+      },
+    });
+
+    this.oauthProviders.set(config.id, {
+      provider,
+      serverUrl: config.url,
+    });
+
+    return provider;
+  }
+
+  private async openMcpAuthorizationUrl(serverName: string, url: string): Promise<void> {
+    const parsedUrl = new URL(url);
+    if (!['http:', 'https:'].includes(parsedUrl.protocol)) {
+      throw new Error(
+        `MCP OAuth authorization URL for ${serverName} uses unsupported protocol: ${parsedUrl.protocol}`
+      );
+    }
+
+    log(`[MCPManager] Opening MCP OAuth authorization for ${serverName}: ${parsedUrl.origin}`);
+    await shell.openExternal(parsedUrl.toString());
   }
 
   /**
@@ -1455,9 +1518,7 @@ export class MCPManager {
           const usedToolNames = new Set<string>();
           const tools = sortedTools.map((tool) => {
             const originalToolName =
-              typeof tool.name === 'string' && tool.name.trim().length > 0
-                ? tool.name
-                : 'tool';
+              typeof tool.name === 'string' && tool.name.trim().length > 0 ? tool.name : 'tool';
             const sanitizedToolName = sanitizeMcpToolSegment(originalToolName, 'tool');
             const prefixedName = createUniqueMcpToolName(
               `mcp__${serverKey}__${sanitizedToolName}`,
@@ -1467,13 +1528,9 @@ export class MCPManager {
               name: prefixedName,
               originalName: originalToolName,
               description: tool.description || '',
-              inputSchema: {
-                type: 'object',
-                // eslint-disable-next-line @typescript-eslint/no-explicit-any
-                properties: (tool.inputSchema as any)?.properties || {},
-                // eslint-disable-next-line @typescript-eslint/no-explicit-any
-                required: (tool.inputSchema as any)?.required,
-              },
+              inputSchema: tool.inputSchema,
+              outputSchema: tool.outputSchema,
+              toolDefinition: tool,
               serverId,
               serverName: config.name,
             } satisfies MCPTool;
@@ -1579,10 +1636,15 @@ export class MCPManager {
           throw new Error(`Tool call timeout after ${MCP_TOOL_CALL_TIMEOUT_MS}ms`);
         }
 
-        const callPromise = client.callTool({
-          name: actualToolName,
-          arguments: args,
-        });
+        const callPromise = client.callTool(
+          {
+            name: actualToolName,
+            arguments: args,
+          },
+          {
+            toolDefinition: currentTool.toolDefinition,
+          }
+        );
         const result = await raceWithTimeout(
           callPromise,
           remainingMs,

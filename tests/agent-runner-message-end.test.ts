@@ -1,6 +1,14 @@
 import { describe, expect, it } from 'vitest';
 
-import { resolveMessageEndPayload, toUserFacingErrorText } from '../src/main/claude/agent-runner-message-end';
+import {
+  buildTerminalErrorEmissionDetails,
+  buildTerminalErrorMessage,
+  resolveAbortDisposition,
+  resolveAssistantStreamErrorText,
+  resolveMessageEndPayload,
+  shouldPreserveExistingTrace,
+  toUserFacingErrorText,
+} from '../src/main/agent/agent-runner-message-end';
 
 describe('resolveMessageEndPayload', () => {
   it('falls back to accumulated streamed text when message_end content is empty', () => {
@@ -16,9 +24,7 @@ describe('resolveMessageEndPayload', () => {
     expect(result.nextStreamedText).toBe('');
     expect(result.errorText).toBeUndefined();
     expect(result.shouldEmitMessage).toBe(true);
-    expect(result.effectiveContent).toEqual([
-      { type: 'text', text: 'streamed fallback' },
-    ]);
+    expect(result.effectiveContent).toEqual([{ type: 'text', text: 'streamed fallback' }]);
   });
 
   it('surfaces user-facing error text when message_end stops with error', () => {
@@ -35,7 +41,9 @@ describe('resolveMessageEndPayload', () => {
     expect(result.nextStreamedText).toBe('');
     expect(result.shouldEmitMessage).toBe(false);
     expect(result.effectiveContent).toEqual([]);
-    expect(result.errorText).toBe('模型响应超时：长时间未收到上游返回，请稍后重试或检查当前模型/网关负载。');
+    expect(result.errorText).toBe(
+      '模型响应超时：长时间未收到上游返回，请稍后重试或检查当前模型/网关负载。'
+    );
   });
 
   it('surfaces empty_success_result when message_end has no content and no streamed fallback', () => {
@@ -51,7 +59,67 @@ describe('resolveMessageEndPayload', () => {
     expect(result.nextStreamedText).toBe('');
     expect(result.shouldEmitMessage).toBe(false);
     expect(result.effectiveContent).toEqual([]);
-    expect(result.errorText).toBe('模型返回了一个空的成功结果，当前模型或网关兼容性可能有问题，请重试或切换协议后再试。');
+    expect(result.errorText).toBe(
+      '模型返回了一个空的成功结果，当前模型或网关兼容性可能有问题，请重试或切换协议后再试。'
+    );
+  });
+
+  it('preserves literal <think> in text as-is (never parsed)', () => {
+    const result = resolveMessageEndPayload({
+      message: {
+        role: 'assistant',
+        content: [{ type: 'text', text: 'Use <think>reasoning</think> to think' }],
+        stopReason: 'stop',
+      },
+      streamedText: '',
+    });
+
+    expect(result.effectiveContent).toEqual([
+      { type: 'text', text: 'Use <think>reasoning</think> to think' },
+    ]);
+  });
+
+  it('preserves literal <think> in thinking block content (reasoning field mentions <think>)', () => {
+    const result = resolveMessageEndPayload({
+      message: {
+        role: 'assistant',
+        content: [
+          {
+            type: 'thinking',
+            thinking: 'The user asks about <think> and </think> tags and what they mean.',
+          },
+          { type: 'text', text: 'The <think> tag wraps reasoning.' },
+        ],
+        stopReason: 'stop',
+      },
+      streamedText: '',
+    });
+
+    expect(result.effectiveContent).toEqual([
+      {
+        type: 'thinking',
+        thinking: 'The user asks about <think> and </think> tags and what they mean.',
+      },
+      { type: 'text', text: 'The <think> tag wraps reasoning.' },
+    ]);
+  });
+
+  it('preserves literal <think> in streamedText when message content is empty (Ollama streaming fallback)', () => {
+    const result = resolveMessageEndPayload({
+      message: {
+        role: 'assistant',
+        content: [],
+        stopReason: 'stop',
+      },
+      streamedText: 'The <think> tag is used for reasoning, not <think>actual reasoning</think>.',
+    });
+
+    expect(result.effectiveContent).toEqual([
+      {
+        type: 'text',
+        text: 'The <think> tag is used for reasoning, not <think>actual reasoning</think>.',
+      },
+    ]);
   });
 });
 
@@ -89,7 +157,7 @@ describe('toUserFacingErrorText', () => {
 
   it('still maps first_response_timeout correctly (regression)', () => {
     expect(toUserFacingErrorText('first_response_timeout')).toBe(
-      '模型响应超时：长时间未收到上游返回，请稍后重试或检查当前模型/网关负载。',
+      '模型响应超时：长时间未收到上游返回，请稍后重试或检查当前模型/网关负载。'
     );
   });
 
@@ -140,5 +208,143 @@ describe('toUserFacingErrorText', () => {
   it('maps "retry delay exceeded" to network connection hint', () => {
     const result = toUserFacingErrorText('retry delay exceeded');
     expect(result).toContain('网络连接中断');
+  });
+});
+
+describe('resolveAssistantStreamErrorText', () => {
+  it('maps provider stream errors through the user-facing formatter', () => {
+    const result = resolveAssistantStreamErrorText({
+      type: 'error',
+      reason: 'error',
+      error: {
+        role: 'assistant',
+        content: [],
+        api: 'openai-completions',
+        provider: 'openai',
+        model: 'gemma4:31b',
+        usage: {
+          input: 0,
+          output: 0,
+          cacheRead: 0,
+          cacheWrite: 0,
+          totalTokens: 0,
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+        },
+        stopReason: 'error',
+        errorMessage: 'HTTP 400: invalid request - malformed tool call JSON',
+        timestamp: 0,
+      },
+    });
+
+    expect(result).toContain('请求被上游拒绝（400）');
+    expect(result).toContain('malformed tool call JSON');
+  });
+
+  it('falls back to the event reason when the provider omits errorMessage', () => {
+    const result = resolveAssistantStreamErrorText({
+      type: 'error',
+      reason: 'aborted',
+      error: {
+        role: 'assistant',
+        content: [],
+        api: 'openai-completions',
+        provider: 'openai',
+        model: 'gemma4:31b',
+        usage: {
+          input: 0,
+          output: 0,
+          cacheRead: 0,
+          cacheWrite: 0,
+          totalTokens: 0,
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+        },
+        stopReason: 'aborted',
+        timestamp: 0,
+      },
+    });
+
+    expect(result).toBe('aborted');
+  });
+
+  it('defensively falls back when the provider omits the error payload entirely', () => {
+    const result = resolveAssistantStreamErrorText({
+      type: 'error',
+      reason: 'error',
+      error: undefined as never,
+    });
+
+    expect(result).toBe('error');
+  });
+});
+
+describe('buildTerminalErrorMessage', () => {
+  it('preserves partial streamed text before the error footer', () => {
+    const result = buildTerminalErrorMessage(
+      'HTTP 400: invalid request',
+      'Partial analysis already streamed'
+    );
+
+    expect(result).toContain('Partial analysis already streamed');
+    expect(result).toContain('**Error**: HTTP 400: invalid request');
+    expect(result).toContain('请检查配置后重试');
+  });
+
+  it('uses the retry hint for non-4xx terminal errors', () => {
+    const result = buildTerminalErrorMessage('connection reset');
+    expect(result).toContain('Agent 正在自动重试');
+  });
+});
+
+describe('buildTerminalErrorEmissionDetails', () => {
+  it('preserves streamed partial text before the error footer', () => {
+    const result = buildTerminalErrorEmissionDetails({
+      errorText: 'HTTP 400: invalid request',
+      streamedText: 'Partial body',
+    });
+
+    expect(result.partialText).toBe('Partial body');
+    expect(result.messageText).toContain('Partial body');
+    expect(result.messageText).toContain('**Error**: HTTP 400: invalid request');
+  });
+
+  it('omits empty flush fragments cleanly', () => {
+    const result = buildTerminalErrorEmissionDetails({
+      errorText: 'connection reset',
+      streamedText: '',
+    });
+
+    expect(result.partialText).toBe('');
+    expect(result.messageText).toContain('Agent 正在自动重试');
+  });
+});
+
+describe('resolveAbortDisposition', () => {
+  it('prioritizes timeout over other abort reasons', () => {
+    expect(
+      resolveAbortDisposition({
+        abortedByTimeout: true,
+        abortedByLoopGuard: true,
+        abortedByStreamError: true,
+      })
+    ).toBe('timeout');
+  });
+
+  it('returns stream_error when only stream-error preservation should apply', () => {
+    expect(
+      resolveAbortDisposition({
+        abortedByTimeout: false,
+        abortedByLoopGuard: false,
+        abortedByStreamError: true,
+      })
+    ).toBe('stream_error');
+  });
+});
+
+describe('shouldPreserveExistingTrace', () => {
+  it('preserves the published error trace for loop guard and stream errors only', () => {
+    expect(shouldPreserveExistingTrace('loop_guard')).toBe(true);
+    expect(shouldPreserveExistingTrace('stream_error')).toBe(true);
+    expect(shouldPreserveExistingTrace('timeout')).toBe(false);
+    expect(shouldPreserveExistingTrace('user')).toBe(false);
   });
 });

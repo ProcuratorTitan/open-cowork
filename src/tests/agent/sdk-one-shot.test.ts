@@ -7,14 +7,14 @@ vi.mock('@earendil-works/pi-ai/compat', () => ({
   getModel: vi.fn(() => undefined),
 }));
 
-vi.mock('../../main/claude/shared-auth', () => ({
+vi.mock('../../main/agent/shared-auth', () => ({
   getSharedModelRuntime: async () => ({
     setRuntimeApiKey: vi.fn(),
   }),
 }));
 
 import type { AppConfig } from '../../main/config/config-store';
-import { runPiAiOneShot } from '../../main/claude/claude-sdk-one-shot';
+import { runPiAiOneShot } from '../../main/agent/sdk-one-shot';
 
 function makeConfig(): AppConfig {
   return {
@@ -27,7 +27,7 @@ function makeConfig(): AppConfig {
     profiles: {},
     activeConfigSetId: 'default',
     configSets: [],
-    claudeCodePath: '',
+    agentCliPath: '',
     defaultWorkdir: '',
     globalSkillsPath: '',
     enableDevLogs: false,

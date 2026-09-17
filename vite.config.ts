@@ -6,6 +6,10 @@ import { builtinModules } from 'module';
 
 // Node built-in modules must be external for Electron main process
 const nodeBuiltins = builtinModules.flatMap((m) => [m, `node:${m}`]);
+// Keep the SDK's module boundary: bundling it makes Rollup's CJS namespace
+// helper crash on inherited enumerable exports from the external `ws` package.
+const googleGenAiExternals = ['@google/genai', /^@google\/genai\//];
+const mcpExternals = [/^@modelcontextprotocol\/(?:client|core|server)(?:\/.*)?$/];
 const ignoredWatchPaths = [
   '**/release/**',
   '**/dist/**',
@@ -30,6 +34,7 @@ export default defineConfig({
             rollupOptions: {
               external: [
                 ...nodeBuiltins,
+                ...googleGenAiExternals,
                 'better-sqlite3',
                 'bufferutil',
                 'utf-8-validate',
@@ -40,7 +45,7 @@ export default defineConfig({
                 '@anthropic-ai/sdk',
                 '@larksuiteoapi/node-sdk',
                 'openai',
-                '@modelcontextprotocol/sdk',
+                ...mcpExternals,
                 'electron-updater',
                 'chokidar',
                 'archiver',
@@ -48,6 +53,8 @@ export default defineConfig({
                 'ws',
                 'glob',
                 'dotenv',
+                '@slack/bolt',
+                '@slack/web-api',
               ],
               output: {
                 // Ensure consistent interop for CJS/ESM

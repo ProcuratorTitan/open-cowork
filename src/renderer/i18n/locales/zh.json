@@ -701,6 +701,21 @@
     "contextUsage": "上下文用量",
     "contextUsageLabel": "{{used}} / {{total}}"
   },
+  "compaction": {
+    "turnsLeft": "轮剩余",
+    "compactNow": "压缩",
+    "compacting": "压缩中…",
+    "confirmTitle": "压缩上下文？",
+    "confirmDescription": "早期对话将被摘要以释放上下文窗口空间。最近的消息和关键决策会被保留。",
+    "confirm": "立即压缩",
+    "history": "压缩历史",
+    "autoCompact": "自动压缩",
+    "manualCompact": "手动压缩",
+    "tokens": "tokens",
+    "summary": "摘要",
+    "filesReferenced": "引用的文件",
+    "more": "更多"
+  },
   "messageCard": {
     "request": "请求",
     "queued": "排队中",
@@ -870,6 +885,14 @@
     "webhookMode": "Webhook 模式",
     "webhookDesc": "飞书主动推送消息到你的服务器，需要公网可访问的地址",
     "localWebhookUrl": "本地 Webhook 地址",
+    "verificationToken": "Verification Token",
+    "verificationTokenPlaceholder": "飞书开放平台的 Verification Token",
+    "verificationTokenHint": "用于校验飞书 URL 挑战请求。请从飞书开放平台 → 事件与回调 中复制。",
+    "verificationTokenRequired": "Webhook 模式必须填写飞书 Verification Token。",
+    "encryptKey": "Encrypt Key",
+    "encryptKeyPlaceholder": "飞书开放平台的 Encrypt Key",
+    "encryptKeyHint": "用于校验 X-Lark-Signature。请从飞书开放平台 → 事件与回调 → 加密策略 中复制。",
+    "encryptKeyRequired": "Webhook 模式必须填写飞书 Encrypt Key。",
     "useBuiltInNgrok": "使用内置 ngrok",
     "ngrokHelpPrefix": "从",
     "ngrokHelpSuffix": "免费获取",
@@ -956,5 +979,11 @@
     "description": "应用遇到了意外错误。你可以点击下方按钮尝试恢复。",
     "details": "错误详情",
     "retry": "重试"
+  },
+  "subagent": {
+    "label": "子代理",
+    "completed": "已完成",
+    "inDuration": "耗时 {{duration}}",
+    "showResult": "查看结果"
   }
 }

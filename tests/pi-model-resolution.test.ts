@@ -3,11 +3,12 @@ import {
   applyPiModelRuntimeOverrides,
   buildPiModelLookupCandidates,
   buildSyntheticPiModel,
+  buildSyntheticPiModelFromRuntimeConfig,
   inferPiApi,
   resolvePiModelString,
   resolvePiRouteProtocol,
   resolveSyntheticPiModelFallback,
-} from '../src/main/claude/pi-model-resolution';
+} from '../src/main/agent/pi-model-resolution';
 
 describe('pi model resolution helpers', () => {
   it('skips invalid custom raw provider lookups and deduplicates candidates', () => {
@@ -127,6 +128,42 @@ describe('pi model resolution helpers', () => {
       provider: 'openai',
       modelId: 'qwen3.5:0.8b',
     });
+  });
+
+  it('reads contextWindow and maxTokens from the runtime config object', () => {
+    const withoutOverrides = buildSyntheticPiModelFromRuntimeConfig(
+      {
+        model: 'llama3.3',
+        provider: 'ollama',
+        customProtocol: 'openai',
+        baseUrl: 'http://localhost:11434/v1',
+      },
+      {
+        resolvedModelString: 'llama3.3',
+        routeProtocol: 'openai',
+        effectiveBaseUrl: 'http://localhost:11434/v1',
+      }
+    );
+    expect(withoutOverrides.contextWindow).toBe(131072);
+    expect(withoutOverrides.maxTokens).toBe(4096);
+
+    const withOverrides = buildSyntheticPiModelFromRuntimeConfig(
+      {
+        model: 'llama3.3',
+        provider: 'ollama',
+        customProtocol: 'openai',
+        baseUrl: 'http://localhost:11434/v1',
+        contextWindow: 32000,
+        maxTokens: 8000,
+      },
+      {
+        resolvedModelString: 'llama3.3',
+        routeProtocol: 'openai',
+        effectiveBaseUrl: 'http://localhost:11434/v1',
+      }
+    );
+    expect(withOverrides.contextWindow).toBe(32000);
+    expect(withOverrides.maxTokens).toBe(8000);
   });
 
   it('downgrades openai responses api to completions for custom endpoints', () => {

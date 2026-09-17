@@ -1,10 +1,10 @@
 import type {
   AssistantMessage,
+  AssistantMessageEvent,
   TextContent,
   ThinkingContent,
   ToolCall,
 } from '@earendil-works/pi-ai';
-import { splitThinkTagBlocks } from './think-tag-parser';
 
 type MessageEndContentBlock = TextContent | ThinkingContent | ToolCall;
 
@@ -21,6 +21,21 @@ interface ResolvedMessageEndPayload {
   nextStreamedText: string;
   shouldEmitMessage: boolean;
 }
+
+const FOUR_XX_ERROR_RE = /\b4\d{2}\b/;
+
+export interface TerminalErrorEmissionDetails {
+  partialText: string;
+  messageText: string;
+}
+
+export interface AbortDispositionFlags {
+  abortedByTimeout: boolean;
+  abortedByLoopGuard: boolean;
+  abortedByStreamError: boolean;
+}
+
+export type AbortDisposition = 'timeout' | 'loop_guard' | 'stream_error' | 'user';
 
 export function toUserFacingErrorText(errorText: string): string {
   const lower = errorText.toLowerCase();
@@ -77,6 +92,51 @@ export function toUserFacingErrorText(errorText: string): string {
   return errorText;
 }
 
+export function resolveAssistantStreamErrorText(
+  event: Extract<AssistantMessageEvent, { type: 'error' }>
+): string {
+  const rawError = event.error?.errorMessage?.trim() || event.reason || 'stream_error';
+  return toUserFacingErrorText(rawError);
+}
+
+export function buildTerminalErrorMessage(errorText: string, partialText = ''): string {
+  const normalizedPartial = partialText.trimEnd();
+  const hint = FOUR_XX_ERROR_RE.test(errorText)
+    ? '_请检查配置后重试。_'
+    : '_Agent 正在自动重试，请稍候..._';
+  const errorBlock = `**Error**: ${errorText}\n\n${hint}`;
+  return normalizedPartial ? `${normalizedPartial}\n\n${errorBlock}` : errorBlock;
+}
+
+export function buildTerminalErrorEmissionDetails(options: {
+  errorText: string;
+  streamedText: string;
+}): TerminalErrorEmissionDetails {
+  const partialText = options.streamedText;
+
+  return {
+    partialText,
+    messageText: buildTerminalErrorMessage(options.errorText, partialText),
+  };
+}
+
+export function resolveAbortDisposition(flags: AbortDispositionFlags): AbortDisposition {
+  if (flags.abortedByTimeout) {
+    return 'timeout';
+  }
+  if (flags.abortedByLoopGuard) {
+    return 'loop_guard';
+  }
+  if (flags.abortedByStreamError) {
+    return 'stream_error';
+  }
+  return 'user';
+}
+
+export function shouldPreserveExistingTrace(disposition: AbortDisposition): boolean {
+  return disposition === 'loop_guard' || disposition === 'stream_error';
+}
+
 export function resolveMessageEndPayload(
   options: ResolveMessageEndPayloadOptions
 ): ResolvedMessageEndPayload {
@@ -108,30 +168,9 @@ export function resolveMessageEndPayload(
     };
   }
 
-  // Post-process: split any <think>...</think> tags in text blocks into
-  // separate thinking + text content blocks for proper UI rendering.
-  const effectiveContent: MessageEndContentBlock[] = [];
-  for (const block of rawContent) {
-    if (block.type === 'text') {
-      const splitBlocks = splitThinkTagBlocks(block.text);
-      for (const splitBlock of splitBlocks) {
-        if (splitBlock.type === 'thinking') {
-          effectiveContent.push({
-            type: 'thinking',
-            thinking: splitBlock.thinking,
-          } as ThinkingContent);
-        } else {
-          effectiveContent.push({ type: 'text', text: splitBlock.text } as TextContent);
-        }
-      }
-    } else {
-      effectiveContent.push(block);
-    }
-  }
-
   return {
-    effectiveContent,
+    effectiveContent: rawContent,
     nextStreamedText,
-    shouldEmitMessage: effectiveContent.length > 0 && (message?.role === 'assistant' || !message),
+    shouldEmitMessage: rawContent.length > 0 && (message?.role === 'assistant' || !message),
   };
 }
