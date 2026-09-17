@@ -180,7 +180,7 @@ describe('probeWithSdk', () => {
       content: [{ type: 'text', text: 'sdk_probe_ok' }],
     });
 
-    const result = await probeWithClaudeSdk(
+    const result = await probeWithSdk(
       {
         provider: 'openai-codex',
         apiKey: '',

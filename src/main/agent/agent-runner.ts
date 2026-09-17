@@ -2247,7 +2247,7 @@ Tool routing:
           cwd: effectiveCwd,
           agentDir: getAgentDir(),
           additionalSkillPaths: skillPaths,
-          appendSystemPrompt: coworkAppendPrompt,
+          appendSystemPrompt: [coworkAppendPrompt],
           extensionFactories: [
             createCompactionExtensionFactory({
               customInstructions: sessionCompactInstructions,
@@ -2812,8 +2812,7 @@ Tool routing:
               break;
             }
 
-            case 'compaction_start':
-            case 'auto_compaction_start': {
+            case 'compaction_start': {
               log('[CoworkAgentRunner] Auto-compaction started, reason:', event.reason);
               compactionStepId = `compaction-${Date.now()}`;
               this.sendTraceStep(session.id, {
