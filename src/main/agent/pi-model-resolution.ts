@@ -153,7 +153,9 @@ export function buildSyntheticPiModel(
   // ponytail: name-based vision heuristic — ceiling: a vision model without
   // 'vision/vl/omni/multimodal' in its id defaults to text-only (safe: text-only
   // models 400 on images, #251). Add an explicit input override if that matters.
-  const looksVision = /vision|vl|omni|multimodal/i.test(modelId);
+  const looksVision = /vision|vl|omni|multimodal|gpt-4o|gpt-4-turbo|gemini|claude-3|claude-4/i.test(
+    modelId
+  );
   return {
     id: modelId,
     name: modelId,

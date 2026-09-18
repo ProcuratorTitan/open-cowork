@@ -91,7 +91,7 @@ export const API_PROVIDER_PRESETS: SharedProviderPresets = {
       { id: 'gpt-6-astra', name: 'gpt-6-astra' },
     ],
     keyPlaceholder: '',
-    keyHint: 'Usa il login ChatGPT OAuth di Pi; non serve una API key OpenAI.',
+    keyHint: 'Sign in with ChatGPT via Pi OAuth; no OpenAI API key required.',
   },
   gemini: {
     name: 'Gemini',
@@ -234,7 +234,7 @@ export function getModelInputGuidance(
   if (provider === 'openai-codex') {
     return {
       placeholder: 'gpt-5.4, gpt-5.5, gpt-5.6-sol',
-      hint: 'Usa il tuo abbonamento ChatGPT Plus/Pro tramite Codex OAuth; non inserire una API key.',
+      hint: 'Use your ChatGPT Plus/Pro subscription via Codex OAuth; do not enter an API key.',
     };
   }
 

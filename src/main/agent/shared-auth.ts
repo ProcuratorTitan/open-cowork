@@ -6,7 +6,10 @@ let sharedModelRuntime: Promise<ModelRuntime> | null = null;
 
 export function getSharedModelRuntime(): Promise<ModelRuntime> {
   if (!sharedModelRuntime) {
-    sharedModelRuntime = ModelRuntime.create();
+    sharedModelRuntime = ModelRuntime.create().catch((err) => {
+      sharedModelRuntime = null;
+      throw err;
+    });
   }
   return sharedModelRuntime;
 }
